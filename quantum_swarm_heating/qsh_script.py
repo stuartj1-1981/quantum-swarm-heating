@@ -12,7 +12,11 @@ import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load add-on options from HA path
+# HA API URL and token from env (set in add-on options or env)
+HA_URL = os.getenv('HA_URL', 'http://supervisor/core/api')  # Internal HA add-on URL
+HA_TOKEN = os.getenv('HA_TOKEN', 'YOUR_LONG_LIVED_TOKEN')
+
+# Load user options from HA add-on path
 try:
     with open('/data/options.json', 'r') as f:
         user_options = json.load(f)
@@ -86,12 +90,18 @@ HOUSE_CONFIG = {
     }
 }
 
-# Merge user options with defaults
-user_options = user_options or {}  # From /data/options.json or empty
-# Example merge for tado_rooms (user list overrides defaults)
-if 'tado_rooms' in user_options:
-    HOUSE_CONFIG['entities'].update({item['room'] + '_temp_set_hum': item['entity'] for item in user_options['tado_rooms']})
-# ... similar for independent_sensors, battery_entities, etc. (add as needed)
+# Load user options from HA add-on path
+try:
+    with open('/data/options.json', 'r') as f:
+        user_options = json.load(f)
+except Exception as e:
+    logging.warning(f"Failed to load options.json: {e}. Using defaults.")
+    user_options = {}
+
+# Merge user options with defaults (e.g., user tado_rooms list overrides)
+if 'tado_rooms' in user_options and isinstance(user_options['tado_rooms'], list):
+    HOUSE_CONFIG['entities'].update({item['room'] + '_temp_set_hum': item['entity'] for item in user_options['tado_rooms'] if isinstance(item, dict) and 'room' in item and 'entity' in item})
+# ... similar merge for independent_sensors (update 'entities' independents), battery_entities (update battery keys), etc.
 
 # ... full funcs: parse_rates_array, get_current_rate, calc_solar_gain, calc_room_loss, total_loss, build_dfan_graph, SimpleQNet, ActorCritic, train_rl as before
 
