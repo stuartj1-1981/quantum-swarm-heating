@@ -6,11 +6,22 @@ import random
 from datetime import datetime, timedelta
 import time
 import logging
+import os
+import json
+import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Default config with your entities (user overrides via options)
-DEFAULT_CONFIG = {
+# Load add-on options from HA path
+try:
+    with open('/data/options.json', 'r') as f:
+        user_options = json.load(f)
+except Exception as e:
+    logging.warning(f"Failed to load options.json: {e}. Using defaults.")
+    user_options = {}
+
+# Default config with your entities (user options override)
+HOUSE_CONFIG = {
     'rooms': { 'lounge': 19.48, 'open_plan_ground': 42.14, 'utility': 3.40, 'cloaks': 2.51,
         'bed1': 18.17, 'bed2': 13.59, 'bed3': 11.07, 'bed4': 9.79, 'bathroom': 6.02, 'ensuite1': 6.38, 'ensuite2': 3.71,
         'hall': 9.15, 'landing': 10.09 },
@@ -75,12 +86,12 @@ DEFAULT_CONFIG = {
     }
 }
 
-# Load user options (configurable entities)
-options = hass.config_entries.async_get_options(hass.config_entries.entry_id)
-# Merge user options with defaults (e.g., user tado_rooms list overrides)
-if 'tado_rooms' in options:
-    HOUSE_CONFIG['entities'].update({item['room'] + '_temp_set_hum': item['entity'] for item in options['tado_rooms']})
-# ... similar merge for independent_sensors (update 'entities' independents), battery_entities (update battery keys), etc.
+# Merge user options with defaults
+user_options = user_options or {}  # From /data/options.json or empty
+# Example merge for tado_rooms (user list overrides defaults)
+if 'tado_rooms' in user_options:
+    HOUSE_CONFIG['entities'].update({item['room'] + '_temp_set_hum': item['entity'] for item in user_options['tado_rooms']})
+# ... similar for independent_sensors, battery_entities, etc. (add as needed)
 
 # ... full funcs: parse_rates_array, get_current_rate, calc_solar_gain, calc_room_loss, total_loss, build_dfan_graph, SimpleQNet, ActorCritic, train_rl as before
 
