@@ -6,53 +6,31 @@ import random
 from datetime import datetime, timedelta
 import time
 import logging
-import os
 import json
-import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# HA API setup (for add-on; if running in HA component, use hass.services.call/hass.states.get instead)
-HA_URL = os.getenv('HA_URL', 'http://supervisor/core/api')
-HA_TOKEN = os.getenv('HA_TOKEN')  # Set in add-on options or env
+# Note: This script assumes it's running in a Home Assistant add-on environment where 'hass' is available (injected by HA).
+# If not, you may need to adjust for your setup (e.g., as a custom component).
 
 def fetch_ha_entity(entity_id, attr=None):
-    if not HA_TOKEN:
-        logging.error("HA_TOKEN not set")
+    state = hass.states.get(entity_id)
+    if state is None:
+        logging.warning(f"Entity {entity_id} not found—using default.")
         return None
-    headers = {'Authorization': f"Bearer {HA_TOKEN}"}
-    try:
-        r = requests.get(f"{HA_URL}/states/{entity_id}", headers=headers)
-        r.raise_for_status()
-        data = r.json()
-        if attr:
-            return data.get('attributes', {}).get(attr)
-        return data.get('state')
-    except Exception as e:
-        logging.error(f"HA fetch error for {entity_id}: {e}")
-        return None
+    if attr:
+        return state.attributes.get(attr)
+    return state.state
 
 def set_ha_service(domain, service, data):
-    if not HA_TOKEN:
-        logging.error("HA_TOKEN not set")
-        return
-    headers = {'Authorization': f"Bearer {HA_TOKEN}"}
     entity_id = data.get('entity_id')
     if isinstance(entity_id, list):
         for eid in entity_id:
             data_single = data.copy()
             data_single['entity_id'] = eid
-            try:
-                r = requests.post(f"{HA_URL}/services/{domain}/{service}", headers=headers, json=data_single)
-                r.raise_for_status()
-            except Exception as e:
-                logging.error(f"HA set error for {eid}: {e}")
+            hass.services.call(domain, service, data_single, blocking=True)
     else:
-        try:
-            r = requests.post(f"{HA_URL}/services/{domain}/{service}", headers=headers, json=data)
-            r.raise_for_status()
-        except Exception as e:
-            logging.error(f"HA set error for {entity_id or data.get('device_id')}: {e}")
+        hass.services.call(domain, service, data, blocking=True)
 
 # Default config
 HOUSE_CONFIG = {
@@ -141,6 +119,9 @@ if 'battery_entities' in options and isinstance(options['battery_entities'], dic
 # Utility functions
 def parse_rates_array(rates_str):
     # Parse Octopus event state (assumes JSON-like string with rates list)
+    if rates_str is None:
+        logging.warning("Rates data is None—using fallback rates.")
+        return []  # Will trigger fallback in get_current_rate
     try:
         rates = json.loads(rates_str) if isinstance(rates_str, str) else rates_str
         return [(r['start'], r['end'], r['value_inc_vat']) for r in rates.get('rates', [])]  # (start, end, price)
@@ -252,6 +233,11 @@ def sim_step(graph, states, config, model, optimizer):
         # Next cheap slot: Find min rate in next 24h
         next_cheap = min(price for _, _, price in all_rates) / 100 if all_rates else config['fallback_rates']['cheap']
 
+        # Total demand (with offsets, chill; add solar gain) — Moved earlier
+        production = float(fetch_ha_entity(config['entities']['solar_production']) or 0)
+        base_loss = total_loss(config, ext_temp, target_temp, chill_factor)
+        total_demand = base_loss + offset_loss + water_load - calc_solar_gain(config, production)
+
         # Battery (compute capacity, stored, available; enhanced logic)
         soc = float(fetch_ha_entity(config['entities']['battery_soc']) or 50.0)
         design_ah = float(fetch_ha_entity(config['entities']['battery_design_capacity_ah']) or 100.0)
@@ -262,7 +248,6 @@ def sim_step(graph, states, config, model, optimizer):
         battery_power = float(fetch_ha_entity(config['entities']['battery_power']) or 0)  # Positive discharge
         charge_rate = 0.0
         discharge_rate = 0.0
-        production = float(fetch_ha_entity(config['entities']['solar_production']) or 0)
         excess_solar = max(0, production - (water_load))  # Excess after basic load; refine with house consumption
         if current_rate < 0.15 and soc < 80 and excess_solar > 0:
             charge_rate = min(config['battery']['max_rate'], excess_solar / config['battery']['efficiency'])
@@ -288,10 +273,6 @@ def sim_step(graph, states, config, model, optimizer):
 
         # CoP
         live_cop = float(fetch_ha_entity(config['entities']['hp_cop']) or 3.5)
-
-        # Total demand (with offsets, chill; add solar gain)
-        base_loss = total_loss(config, ext_temp, target_temp, chill_factor)
-        total_demand = base_loss + offset_loss + water_load - calc_solar_gain(config, production)
 
         # Optimal flow/mode (with proactive boost)
         flow_min = float(fetch_ha_entity(config['entities']['flow_min_temp']) or 32.0)
