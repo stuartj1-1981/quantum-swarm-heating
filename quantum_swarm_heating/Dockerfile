@@ -1,4 +1,4 @@
-FROM ghcr.io/home-assistant/amd64-base-python
+FROM ghcr.io/home-assistant/amd64-base-debian
 
 # Install dependencies
 RUN pip install --no-cache-dir numpy==1.26.4 \
