@@ -16,6 +16,35 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 HA_URL = os.getenv('HA_URL', 'http://supervisor/core/api')  # Internal HA add-on URL
 HA_TOKEN = os.getenv('HA_TOKEN', 'YOUR_LONG_LIVED_TOKEN')
 
+def fetch_ha_entity(entity_id, attr=None):
+    headers = {'Authorization': f"Bearer {HA_TOKEN}"}
+    try:
+        r = requests.get(f"{HA_URL}/states/{entity_id}", headers=headers)
+        data = r.json()
+        return data['attributes'].get(attr) if attr else data['state']
+    except Exception as e:
+        logging.error(f"HA pull error for {entity_id}: {e}")
+        return None
+
+def set_ha_service(domain, service, data):
+    headers = {'Authorization': f"Bearer {HA_TOKEN}"}
+    entity_id = data['entity_id']
+    if isinstance(entity_id, list):
+        for eid in entity_id:
+            data_single = data.copy()
+            data_single['entity_id'] = eid
+            try:
+                r = requests.post(f"{HA_URL}/services/{domain}/{service}", headers=headers, json=data_single)
+                if r.status_code != 200: logging.error(f"HA set error: {r.text}")
+            except Exception as e:
+                logging.error(f"HA set error for {eid}: {e}")
+    else:
+        try:
+            r = requests.post(f"{HA_URL}/services/{domain}/{service}", headers=headers, json=data)
+            if r.status_code != 200: logging.error(f"HA set error: {r.text}")
+        except Exception as e:
+            logging.error(f"HA set error for {entity_id}: {e}")
+
 # Load user options from HA add-on path
 try:
     with open('/data/options.json', 'r') as f:
@@ -90,18 +119,10 @@ HOUSE_CONFIG = {
     }
 }
 
-# Load user options from HA add-on path
-try:
-    with open('/data/options.json', 'r') as f:
-        user_options = json.load(f)
-except Exception as e:
-    logging.warning(f"Failed to load options.json: {e}. Using defaults.")
-    user_options = {}
-
 # Merge user options with defaults (e.g., user tado_rooms list overrides)
 if 'tado_rooms' in user_options and isinstance(user_options['tado_rooms'], list):
     HOUSE_CONFIG['entities'].update({item['room'] + '_temp_set_hum': item['entity'] for item in user_options['tado_rooms'] if isinstance(item, dict) and 'room' in item and 'entity' in item})
-# ... similar merge for independent_sensors (update 'entities' independents), battery_entities (update battery keys), etc.
+# ... similar merge for independent_sensors, battery_entities, etc.
 
 # ... full funcs: parse_rates_array, get_current_rate, calc_solar_gain, calc_room_loss, total_loss, build_dfan_graph, SimpleQNet, ActorCritic, train_rl as before
 
