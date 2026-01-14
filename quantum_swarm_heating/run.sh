@@ -1,2 +1,2 @@
-#!/usr/bin/env bash
-python3 /app/qsh_script.py
+#!/usr/bin/with-contenv bashio
+python3 /qsh_script.py
