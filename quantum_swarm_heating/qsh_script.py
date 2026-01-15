@@ -65,6 +65,9 @@ except Exception as e:
     logging.warning(f"Failed to load options.json: {e}. Using defaults.")
     user_options = {}
 
+logging.info(f"Loaded user_options: {user_options}")
+logging.info(f"Detected HA_TOKEN: {HA_TOKEN if HA_TOKEN else 'None'}")
+
 # Default config
 HOUSE_CONFIG = {
     'rooms': { 'lounge': 19.48, 'open_plan_ground': 42.14, 'utility': 3.40, 'cloaks': 2.51,
