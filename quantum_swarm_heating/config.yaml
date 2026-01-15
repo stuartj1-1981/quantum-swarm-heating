@@ -16,6 +16,7 @@ options:
   independent_sensors: []
   battery_entities: "{}"
   global_entities: "{}"
+  ha_token: ""
 schema:
   tado_rooms:
     - map:
@@ -27,4 +28,5 @@ schema:
         entity: str
   battery_entities: str?
   global_entities: str?
+  ha_token: str?
 

@@ -1,23 +1,12 @@
-ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base:latest
-FROM $BUILD_FROM
+FROM python:3.12-slim
 
-# Install Python + pip + build tools
-RUN apk add --no-cache \
-        python3 \
-        py3-pip \
-        py3-numpy \
-        build-base \
-        python3-dev
+# Install dependencies
+RUN pip install --no-cache-dir numpy==1.26.4 \
+    && pip install --no-cache-dir torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir networkx requests
 
-# Install PyTorch CPU wheels (manylinux)
-RUN pip3 install --no-cache-dir torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cpu
-
-# Install your other deps
-RUN pip3 install --no-cache-dir networkx requests
-
+# Copy script
 COPY qsh_script.py /qsh_script.py
-COPY run.sh /run.sh
 
-RUN chmod a+x /run.sh
-
-CMD [ "/run.sh" ]
+# Run script
+CMD ["python", "/qsh_script.py"]
