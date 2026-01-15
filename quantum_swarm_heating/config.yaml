@@ -9,7 +9,6 @@ boot: auto
 hassio_api: true
 homeassistant_api: true
 apparmor: false
-map: - config:rw
 options:
   tado_rooms: "[]"
   independent_sensors: "[]"
