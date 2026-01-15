@@ -142,12 +142,17 @@ if 'tado_rooms' in user_options and isinstance(user_options['tado_rooms'], list)
 
 def parse_rates_array(rates_str):
     if rates_str is None:
+        logging.warning("Rates data is None—using fallback rates.")
         return []
     try:
-        rates = json.loads(rates_str) if isinstance(rates_str, str) else rates_str
+        # If already dict/list, use as-is
+        if isinstance(rates_str, (dict, list)):
+            rates = rates_str
+        else:
+            rates = json.loads(rates_str)
         return [(r['start'], r['end'], r['value_inc_vat']) for r in rates.get('rates', [])]
     except Exception as e:
-        logging.error(f"Rate parse error: {e}")
+        logging.error(f"Rate parse error: {e} — using fallback rates.")
         return []
 
 def get_current_rate(rates):
