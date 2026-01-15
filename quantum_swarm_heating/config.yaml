@@ -10,15 +10,15 @@ hassio_api: true
 homeassistant_api: true
 apparmor: false
 options:
-  tado_rooms: []
-  independent_sensors: []
-  battery_entities: {}
-  global_entities: {}
+  tado_rooms: "[]"
+  independent_sensors: "[]"
+  battery_entities: "{}"
+  global_entities: "{}"
   ha_token: ""
 schema:
-  tado_rooms: list({room: str, entity: str?})?
-  independent_sensors: list({name: str, entity: str?})?
-  battery_entities: dict(str: str)?
-  global_entities: dict(str: str)?
+  tado_rooms: str?
+  independent_sensors: str?
+  battery_entities: str?
+  global_entities: str?
   ha_token: str?
 
