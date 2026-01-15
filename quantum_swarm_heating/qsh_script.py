@@ -337,5 +337,4 @@ def live_loop(graph, states, config, model, optimizer):
         sim_step(graph, states, config, model, optimizer)
         time.sleep(600)
 
-live_loop(graph, states, HOUSE_CONFIG, model, optimizer)</parameter>
-</xai:function_call>
+live_loop(graph, states, HOUSE_CONFIG, model, optimizer)
