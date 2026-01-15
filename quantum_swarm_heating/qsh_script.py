@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import logging
 import os
@@ -151,10 +151,15 @@ def parse_rates_array(rates_list):
         return []
 
 def get_current_rate(rates):
-    now = datetime.now()
+    now = datetime.utcnow()  # Use UTC-aware now for comparison with aware rates timestamps
     for start, end, price in rates:
-        if datetime.fromisoformat(start) <= now < datetime.fromisoformat(end):
-            return price / 100
+        try:
+            start_dt = datetime.fromisoformat(start)
+            end_dt = datetime.fromisoformat(end)
+            if start_dt <= now < end_dt:
+                return price / 100
+        except ValueError as e:
+            logging.warning(f"Invalid date in rates: {e} — skipping entry.")
     return HOUSE_CONFIG['fallback_rates']['standard']
 
 def calc_solar_gain(config, production):
