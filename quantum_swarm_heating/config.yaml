@@ -12,13 +12,13 @@ apparmor: false
 options:
   tado_rooms: []
   independent_sensors: []
-  battery_entities: "{}"
-  global_entities: "{}"
+  battery_entities: {}
+  global_entities: {}
   ha_token: ""
 schema:
-  tado_rooms: str?
-  independent_sensors: str?
-  battery_entities: str?
-  global_entities: str?
+  tado_rooms: list({room: str, entity: str?})?
+  independent_sensors: list({name: str, entity: str?})?
+  battery_entities: dict(str: str)?
+  global_entities: dict(str: str)?
   ha_token: str?
 
