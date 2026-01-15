@@ -14,36 +14,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # HA API URL and token from env (set in add-on options or env)
 HA_URL = os.getenv('HA_URL', 'http://supervisor/core/api')  # Internal HA add-on URL
-HA_TOKEN = user_options.get('ha_token') or os.getenv('HA_TOKEN', 'YOUR_LONG_LIVED_TOKEN')
-
-def fetch_ha_entity(entity_id, attr=None):
-    headers = {'Authorization': f"Bearer {HA_TOKEN}"}
-    try:
-        r = requests.get(f"{HA_URL}/states/{entity_id}", headers=headers)
-        data = r.json()
-        return data['attributes'].get(attr) if attr else data['state']
-    except Exception as e:
-        logging.error(f"HA pull error for {entity_id}: {e}")
-        return None
-
-def set_ha_service(domain, service, data):
-    headers = {'Authorization': f"Bearer {HA_TOKEN}"}
-    entity_id = data['entity_id']
-    if isinstance(entity_id, list):
-        for eid in entity_id:
-            data_single = data.copy()
-            data_single['entity_id'] = eid
-            try:
-                r = requests.post(f"{HA_URL}/services/{domain}/{service}", headers=headers, json=data_single)
-                if r.status_code != 200: logging.error(f"HA set error: {r.text}")
-            except Exception as e:
-                logging.error(f"HA set error for {eid}: {e}")
-    else:
-        try:
-            r = requests.post(f"{HA_URL}/services/{domain}/{service}", headers=headers, json=data)
-            if r.status_code != 200: logging.error(f"HA set error: {r.text}")
-        except Exception as e:
-            logging.error(f"HA set error for {entity_id}: {e}")
+HA_TOKEN = os.getenv('HA_TOKEN', 'YOUR_LONG_LIVED_TOKEN')
 
 # Load user options from HA add-on path
 try:
