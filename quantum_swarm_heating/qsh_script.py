@@ -12,7 +12,7 @@ import requests
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load user options (optional for now, as hardcoded; can re-enable for deployability)
+# Load user options
 try:
     with open('/data/options.json', 'r') as f:
         user_options = json.load(f)
@@ -120,7 +120,8 @@ HOUSE_CONFIG = {
         'flow_min_temp': 'input_number.flow_min_temperature',
         'flow_max_temp': 'input_number.flow_max_temperature',
         'hp_cop': 'sensor.live_cop_calc',
-        'dfan_control_toggle': 'input_boolean.dfan_control'
+        'dfan_control_toggle': 'input_boolean.dfan_control',
+        'pid_target_temperature': 'input_number.pid_target_temperature'  # Added for dynamic target_temp
     },
     'zone_sensor_map': { 'hall': 'independent_sensor01', 'bed1': 'independent_sensor02', 'landing': 'independent_sensor03', 'open_plan_ground': 'independent_sensor04',
         'utility': 'independent_sensor01', 'cloaks': 'independent_sensor01', 'bed2': 'independent_sensor02', 'bed3': 'independent_sensor03', 'bed4': 'independent_sensor03',
