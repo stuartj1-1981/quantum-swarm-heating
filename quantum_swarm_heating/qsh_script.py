@@ -322,6 +322,75 @@ def sim_step(graph, states, config, model, optimizer):
             logging.info("Hot water cycle active—pausing space heating sets.")
             return
 
+        # ───────────────────────────────────────────────────────────────
+        # ALWAYS update shadow/preview entities (even in shadow mode)
+        # ───────────────────────────────────────────────────────────────
+        set_ha_service('input_number', 'set_value', {
+            'entity_id': 'input_number.qsh_shadow_flow',
+            'value': optimal_flow
+        })
+
+        set_ha_service('select', 'select_option', {
+            'entity_id': 'select.qsh_shadow_mode',
+            'option': optimal_mode
+        })
+
+        set_ha_service('input_number', 'set_value', {
+            'entity_id': 'input_number.qsh_shadow_total_demand',
+            'value': total_demand
+        })
+
+        set_ha_service('input_number', 'set_value', {
+            'entity_id': 'input_number.qsh_shadow_charge_rate',
+            'value': charge_rate
+        })
+
+        set_ha_service('input_number', 'set_value', {
+            'entity_id': 'input_number.qsh_shadow_discharge_rate',
+            'value': discharge_rate
+        })
+
+        set_ha_service('input_number', 'set_value', {
+            'entity_id': 'input_number.qsh_shadow_rl_reward',
+            'value': reward
+        })
+
+        set_ha_service('input_number', 'set_value', {
+            'entity_id': 'input_number.qsh_shadow_rl_loss',
+            'value': loss.item()
+        })
+
+        # Update shadow room setpoints (per-room suggestions)
+        for room in config['rooms']:
+            entity_key = room + '_temp_set_hum'
+            if entity_key in config['entities']:
+                suggested_temp = target_temp + zone_offsets.get(room, 0)
+                logging.info(f"Suggested setpoint for {room}: {suggested_temp:.1f}°C (shadow)")
+
+                # Map to shadow entity (adjust names if needed)
+                shadow_map = {
+                    'lounge': 'input_number.qsh_shadow_lounge_setpoint',
+                    'open_plan_ground': 'input_number.qsh_shadow_open_plan_setpoint',
+                    'utility': 'input_number.qsh_shadow_utility_setpoint',
+                    'cloaks': 'input_number.qsh_shadow_cloaks_setpoint',
+                    'bed1': 'input_number.qsh_shadow_bed1_setpoint',
+                    'bed2': 'input_number.qsh_shadow_bed2_setpoint',
+                    'bed3': 'input_number.qsh_shadow_bed3_setpoint',
+                    'bed4': 'input_number.qsh_shadow_bed4_setpoint',
+                    'bathroom': 'input_number.qsh_shadow_bathroom_setpoint',
+                    'ensuite1': 'input_number.qsh_shadow_ensuite1_setpoint',
+                    'ensuite2': 'input_number.qsh_shadow_ensuite2_setpoint',
+                    'hall': 'input_number.qsh_shadow_hall_setpoint',
+                    'landing': 'input_number.qsh_shadow_landing_setpoint'
+                }
+                shadow_entity = shadow_map.get(room)
+                if shadow_entity:
+                    set_ha_service('input_number', 'set_value', {
+                        'entity_id': shadow_entity,
+                        'value': suggested_temp
+                    })
+        # ───────────────────────────────────────────────────────────────
+
         if dfan_control:
             for room in config['rooms']:
                 entity_key = room + '_temp_set_hum'
@@ -342,7 +411,7 @@ def sim_step(graph, states, config, model, optimizer):
         else:
             logging.info(f"Shadow mode: DFAN would set flow {optimal_flow:.1f}°C and mode {optimal_mode}.")
 
-        action = model.actor(states.unsqueeze(0))
+        # RL update (with defaults if needed)
         reward = -current_rate * total_demand / live_cop + (net_export * config['fallback_rates']['export']) - (abs(charge_rate) * (1 - config['battery']['efficiency']))
         reward += (live_cop - 3.0) * 0.5 - (offset_loss * 0.1)
         reward += (charge_rate * (next_cheap - current_rate)) if charge_rate > 0 else - (discharge_rate * current_rate)
