@@ -70,16 +70,17 @@ def set_ha_service(domain, service, data):
             logging.error(f"HA set error for {entity_id or data.get('device_id')}: {e}")
 
 # Hardcoded HOUSE_CONFIG for your specific setup (full Tado entities added; peak_loss=5.0 from -3°C calc)
+# Updated: Renamed 'open_plan_ground' to 'open_plan' for entity name consistency (avoids _ground in shadow setpoints)
 HOUSE_CONFIG = {
-    'rooms': { 'lounge': 19.48, 'open_plan_ground': 42.14, 'utility': 3.40, 'cloaks': 2.51,
+    'rooms': { 'lounge': 19.48, 'open_plan': 42.14, 'utility': 3.40, 'cloaks': 2.51,
         'bed1': 18.17, 'bed2': 13.59, 'bed3': 11.07, 'bed4': 9.79, 'bathroom': 6.02, 'ensuite1': 6.38, 'ensuite2': 3.71,
         'hall': 9.15, 'landing': 10.09 },
-    'facings': { 'lounge': 0.2, 'open_plan_ground': 1.0, 'utility': 0.5, 'cloaks': 0.5,
+    'facings': { 'lounge': 0.2, 'open_plan': 1.0, 'utility': 0.5, 'cloaks': 0.5,
         'bed1': 0.2, 'bed2': 1.0, 'bed3': 0.5, 'bed4': 0.5, 'bathroom': 0.2, 'ensuite1': 0.5, 'ensuite2': 1.0,
         'hall': 0.2, 'landing': 0.2 },
     'entities': {
         'lounge_temp_set_hum': 'climate.tado_smart_radiator_thermostat_va4240580352',
-        'open_plan_ground_temp_set_hum': ['climate.tado_smart_radiator_thermostat_va0349246464', 'climate.tado_smart_radiator_thermostat_va3553629184'],  # Dining and family room; add kitchen if separate
+        'open_plan_temp_set_hum': ['climate.tado_smart_radiator_thermostat_va0349246464', 'climate.tado_smart_radiator_thermostat_va3553629184'],  # Dining and family room; add kitchen if separate (updated key)
         'utility_temp_set_hum': 'climate.tado_smart_radiator_thermostat_va1604136448',
         'cloaks_temp_set_hum': 'climate.tado_smart_radiator_thermostat_va0949825024',
         'bed1_temp_set_hum': 'climate.tado_smart_radiator_thermostat_va1287620864',
@@ -123,7 +124,7 @@ HOUSE_CONFIG = {
         'dfan_control_toggle': 'input_boolean.dfan_control',
         'pid_target_temperature': 'input_number.pid_target_temperature'  # Added for dynamic target_temp
     },
-    'zone_sensor_map': { 'hall': 'independent_sensor01', 'bed1': 'independent_sensor02', 'landing': 'independent_sensor03', 'open_plan_ground': 'independent_sensor04',
+    'zone_sensor_map': { 'hall': 'independent_sensor01', 'bed1': 'independent_sensor02', 'landing': 'independent_sensor03', 'open_plan': 'independent_sensor04',
         'utility': 'independent_sensor01', 'cloaks': 'independent_sensor01', 'bed2': 'independent_sensor02', 'bed3': 'independent_sensor03', 'bed4': 'independent_sensor03',
         'bathroom': 'independent_sensor03', 'ensuite1': 'independent_sensor02', 'ensuite2': 'independent_sensor03', 'lounge': 'independent_sensor01' },
     'hot_water': {'load_kw': 2.5, 'ext_threshold': 3.0, 'cycle_start_hour': 0, 'cycle_end_hour': 6, 'tank_low_threshold': 40.0},
@@ -188,7 +189,7 @@ def build_dfan_graph(config):
     G = nx.Graph()
     for room in config['rooms']:
         G.add_node(room, area=config['rooms'][room], facing=config['facings'][room])
-    G.add_edges_from([('lounge', 'hall'), ('open_plan_ground', 'utility')])
+    G.add_edges_from([('lounge', 'hall'), ('open_plan', 'utility')])  # Updated edge for renamed room
     return G
 
 class SimpleQNet(nn.Module):
