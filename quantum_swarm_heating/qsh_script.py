@@ -71,6 +71,7 @@ def set_ha_service(domain, service, data):
 
 # Hardcoded HOUSE_CONFIG for your specific setup (full Tado entities added; peak_loss=5.0 from -3°C calc)
 # Updated: Renamed 'open_plan_ground' to 'open_plan' for entity name consistency (avoids _ground in shadow setpoints)
+# Added design_target and peak_ext for calibrated loss_coeff
 HOUSE_CONFIG = {
     'rooms': { 'lounge': 19.48, 'open_plan': 42.14, 'utility': 3.40, 'cloaks': 2.51,
         'bed1': 18.17, 'bed2': 13.59, 'bed3': 11.07, 'bed4': 9.79, 'bathroom': 6.02, 'ensuite1': 6.38, 'ensuite2': 3.71,
@@ -133,6 +134,8 @@ HOUSE_CONFIG = {
     'fallback_rates': {'cheap': 0.1495, 'standard': 0.3048, 'peak': 0.4572, 'export': 0.15},
     'inverter': {'fallback_efficiency': 0.95},
     'peak_loss': 5.0,  # Updated to 5.0 kW @ -3°C based on your heat loss calc
+    'design_target': 21.0,  # Design internal temp for peak_loss calc
+    'peak_ext': -3.0,       # Design external temp for peak_loss
     'hp_flow_service': {
         'domain': 'octopus_energy',
         'service': 'set_heat_pump_flow_temp_config',
@@ -175,15 +178,18 @@ def get_current_rate(rates):
 def calc_solar_gain(config, production):
     return production * 0.5
 
-def calc_room_loss(config, room, delta_temp, chill_factor=1.0):
+def calc_room_loss(config, room, delta_temp, chill_factor=1.0, loss_coeff=0.0, sum_af=0.0):
     area = config['rooms'].get(room, 0)
     facing = config['facings'].get(room, 1.0)
-    loss = area * max(0, delta_temp) * facing * chill_factor / 10
+    if sum_af == 0:
+        return 0.0
+    room_coeff = (area * facing / sum_af) * loss_coeff
+    loss = room_coeff * max(0, delta_temp) * chill_factor
     return loss
 
-def total_loss(config, ext_temp, target_temp=21.0, chill_factor=1.0):
+def total_loss(config, ext_temp, target_temp=21.0, chill_factor=1.0, loss_coeff=0.0, sum_af=0.0):
     delta = target_temp - ext_temp
-    return sum(calc_room_loss(config, room, delta, chill_factor) for room in config['rooms'])
+    return sum(calc_room_loss(config, room, delta, chill_factor, loss_coeff, sum_af) for room in config['rooms'])
 
 def build_dfan_graph(config):
     G = nx.Graph()
@@ -231,6 +237,12 @@ def sim_step(graph, states, config, model, optimizer):
             chill_delta = max(0, ext_temp - effective_temp)
             chill_factor = 1.0 + (chill_delta / max(1, delta))
         logging.info(f"Computed chill_factor: {chill_factor:.2f} based on wind {wind_speed} km/h")
+        
+        # Compute loss_coeff and sum_af here
+        loss_coeff = config['peak_loss'] / (config['design_target'] - config['peak_ext']) if (config['design_target'] > config['peak_ext']) else 0.0
+        sum_af = sum(config['rooms'][r] * config['facings'][r] for r in config['rooms'])
+        logging.info(f"Computed loss_coeff: {loss_coeff:.3f} kW/°C, sum_af: {sum_af:.3f}")
+        
         forecast = fetch_ha_entity(config['entities']['forecast_weather'], 'forecast') or []
         forecast_temps = [f['temperature'] for f in forecast if 'temperature' in f and (datetime.fromisoformat(f['datetime']) - datetime.now()) < timedelta(hours=24)]
         forecast_min_temp = min(forecast_temps) if forecast_temps else ext_temp
@@ -251,7 +263,11 @@ def sim_step(graph, states, config, model, optimizer):
                 zone_temp = float(fetch_ha_entity(sensor_entity) or target_temp)
                 offset = target_temp - zone_temp
                 zone_offsets[zone] = offset
-                offset_loss += abs(offset)
+                if sum_af > 0:
+                    area = config['rooms'].get(zone, 0)
+                    facing = config['facings'].get(zone, 1.0)
+                    zone_coeff = (area * facing / sum_af) * loss_coeff
+                    offset_loss += zone_coeff * offset  # No abs; negatives reduce demand
 
         # Rates fetching (with time check for next_day)
         current_day_rates_list = fetch_ha_entity(config['entities']['current_day_rates'], 'rates') or []
@@ -271,7 +287,7 @@ def sim_step(graph, states, config, model, optimizer):
         next_cheap = min(price for _, _, price in all_rates) / 100 if all_rates else config['fallback_rates']['cheap']
 
         production = float(fetch_ha_entity(config['entities']['solar_production']) or 0)
-        base_loss = total_loss(config, ext_temp, target_temp, chill_factor)
+        base_loss = total_loss(config, ext_temp, target_temp, chill_factor, loss_coeff, sum_af)
         total_demand = base_loss + offset_loss + water_load - calc_solar_gain(config, production)
 
         soc = float(fetch_ha_entity(config['entities']['battery_soc']) or 50.0)
@@ -345,7 +361,7 @@ def sim_step(graph, states, config, model, optimizer):
 
         action = model.actor(states.unsqueeze(0))
         reward = -current_rate * total_demand / live_cop + (net_export * config['fallback_rates']['export']) - (abs(charge_rate) * (1 - config['battery']['efficiency']))
-        reward += (live_cop - 3.0) * 0.5 - (offset_loss * 0.1)
+        reward += (live_cop - 3.0) * 0.5 - (abs(offset_loss) * 0.1)  # Updated to abs(offset_loss) for reward if needed, but since offset_loss can be negative, adjust as per intent
         reward += (charge_rate * (next_cheap - current_rate)) if charge_rate > 0 else - (discharge_rate * current_rate)
         value = model.critic(states.unsqueeze(0))
         loss = (reward - value).pow(2).mean()
