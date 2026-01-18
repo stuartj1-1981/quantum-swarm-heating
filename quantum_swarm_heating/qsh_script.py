@@ -341,7 +341,11 @@ def sim_step(graph, states, config, model, optimizer):
         net_import = max(0, grid_power)
         net_export = max(0, -grid_power)
 
-        live_cop = float(fetch_ha_entity(config['entities']['hp_cop']) or 3.5)
+        cop_value = fetch_ha_entity(config['entities']['hp_cop'])
+        live_cop = float(cop_value) if cop_value and cop_value != 'unavailable' else 3.5
+        if live_cop <= 0:
+            live_cop = 3.5
+            logging.warning("Live COP was <=0; using fallback 3.5")
 
         flow_min = float(fetch_ha_entity(config['entities']['flow_min_temp']) or 32.0)
         flow_max = float(fetch_ha_entity(config['entities']['flow_max_temp']) or 50.0)
