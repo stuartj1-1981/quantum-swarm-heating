@@ -77,6 +77,7 @@ def set_ha_service(domain, service, data):
 # Reverted: peak_loss to 5.0 kW @ -3°C based on real world data from previous conversations
 # Removed: hot_water config and unnecessary battery/hot water entities (status-only fetches retained where needed)
 # Re-added: 'water_heater' entity for status-only detection of 'high_demand' mode
+# Added: 'grid_power' entity as per latest integration
 HOUSE_CONFIG = {
     'rooms': { 'lounge': 19.48, 'open_plan': 42.14, 'utility': 3.40, 'cloaks': 2.51,
         'bed1': 18.17, 'bed2': 13.59, 'bed3': 11.07, 'bed4': 9.79, 'bathroom': 6.02, 'ensuite1': 6.38, 'ensuite2': 3.71,
@@ -118,7 +119,8 @@ HOUSE_CONFIG = {
         'flow_max_temp': 'input_number.flow_max_temperature',
         'hp_cop': 'sensor.live_cop_calc',
         'dfan_control_toggle': 'input_boolean.dfan_control',
-        'pid_target_temperature': 'input_number.pid_target_temperature'  # Added for dynamic target_temp
+        'pid_target_temperature': 'input_number.pid_target_temperature',  # Added for dynamic target_temp
+        'grid_power': 'sensor.givtcp_ce2029g082_grid_power'  # Added for grid power integration
     },
     'zone_sensor_map': { 'hall': 'independent_sensor01', 'bed1': 'independent_sensor02', 'landing': 'independent_sensor03', 'open_plan': 'independent_sensor04',
         'utility': 'independent_sensor01', 'cloaks': 'independent_sensor01', 'bed2': 'independent_sensor02', 'bed3': 'independent_sensor03', 'bed4': 'independent_sensor03',
@@ -308,7 +310,13 @@ def sim_step(graph, states, config, model, optimizer):
         charge_rate = 0.0
         discharge_rate = 0.0
         excess_solar = max(0, production)
-        total_demand_adjusted = total_demand
+        
+        # Fetch grid power (positive: import, negative: export)
+        grid_power = float(fetch_ha_entity(config['entities']['grid_power']) or 0.0)
+        logging.info(f"Fetched grid_power: {grid_power:.2f} kW")
+
+        # Adjust total_demand_adjusted (post-solar/battery, incorporating grid)
+        total_demand_adjusted = max(0, total_demand - excess_solar + max(0, -discharge_rate)) + max(0, grid_power)  # Clamp to avoid negatives
 
         cop_value = fetch_ha_entity(config['entities']['hp_cop'])
         live_cop = float(cop_value) if cop_value and cop_value != 'unavailable' else 3.5
@@ -342,7 +350,8 @@ def sim_step(graph, states, config, model, optimizer):
                      f"ext_temp={ext_temp:.1f}°C, upcoming_cold={upcoming_cold}, current_rate={current_rate:.3f} GBP/kWh, "
                      f"hot_water_active={hot_water_active}")
 
-        states = torch.tensor([current_rate, soc, live_cop, optimal_flow, total_demand, excess_solar, wind_speed, forecast_min_temp], dtype=torch.float32)
+        # Expand states to include grid_power (state_dim now 9)
+        states = torch.tensor([current_rate, soc, live_cop, optimal_flow, total_demand, excess_solar, wind_speed, forecast_min_temp, grid_power], dtype=torch.float32)
 
         if dfan_control:
             for room in config['rooms']:
@@ -367,6 +376,13 @@ def sim_step(graph, states, config, model, optimizer):
         action = model.actor(states.unsqueeze(0))
         reward = -current_rate * total_demand / live_cop
         reward += (live_cop - 3.0) * 0.5 - (abs(heat_up_power) * 0.1)  # Updated to use heat_up_power
+        
+        # RL reward tweak for grid power (penalize imports during peaks, bonus for exports)
+        if current_rate > 0.3 and grid_power > 0.5:
+            reward -= grid_power * current_rate * 0.2  # Cost hit for unoffset imports
+        elif grid_power < -1.0:
+            reward += abs(grid_power) * config['fallback_rates']['export'] * 0.1  # Export bonus
+        
         value = model.critic(states.unsqueeze(0))
         loss = (reward - value).pow(2).mean()
         optimizer.zero_grad()
@@ -402,7 +418,7 @@ def sim_step(graph, states, config, model, optimizer):
         logging.error(f"Sim step error: {e}")
 
 graph = build_dfan_graph(HOUSE_CONFIG)
-state_dim = 8
+state_dim = 9  # Updated to 9 for grid_power addition
 action_dim = 2
 model = ActorCritic(state_dim, action_dim)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
