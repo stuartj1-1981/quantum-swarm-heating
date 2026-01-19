@@ -58,28 +58,28 @@ def set_ha_service(domain, service, data):
         for eid in entity_id:
             data_single = data.copy()
             data_single['entity_id'] = eid
-            try:
-                r = requests.post(f"{HA_URL}/services/{domain}/{service}", headers=headers, json=data_single)
-                r.raise_for_status()
-            except Exception as e:
-                logging.error(f"HA set error for {eid}: {e}")
+            _post_with_retry(domain, service, data_single, headers)
     else:
+        _post_with_retry(domain, service, data, headers)
+
+def _post_with_retry(domain, service, data, headers):
+    for attempt in range(3):
         try:
             r = requests.post(f"{HA_URL}/services/{domain}/{service}", headers=headers, json=data)
             r.raise_for_status()
+            return
+        except requests.exceptions.HTTPError as e:
+            if r.status_code == 500 and attempt < 2:
+                logging.warning(f"500 error on {domain}.{service}—retrying in 5s...")
+                time.sleep(5)
+            else:
+                logging.error(f"HA set error for {data.get('entity_id') or data.get('device_id')}: {e}")
+                return
         except Exception as e:
-            logging.error(f"HA set error for {entity_id or data.get('device_id')}: {e}")
+            logging.error(f"HA set error for {data.get('entity_id') or data.get('device_id')}: {e}")
+            return
 
-# Hardcoded HOUSE_CONFIG for your specific setup (full Tado entities added; peak_loss=5.0 from -3°C calc)
-# Updated: Renamed 'open_plan_ground' to 'open_plan' for entity name consistency (avoids _ground in shadow setpoints)
-# Added design_target and peak_ext for calibrated loss_coeff
-# Added thermal_mass_per_m2 and heat_up_tau_h for thermal mass modeling
-# Reverted: peak_loss to 5.0 kW @ -3°C based on real world data from previous conversations
-# Removed: hot_water config and unnecessary battery/hot water entities (status-only fetches retained where needed)
-# Re-added: 'water_heater' entity for status-only detection of 'high_demand' mode
-# Added: 'grid_power' entity as per latest integration
-# New: 'persistent_zones' for always-open balancing (bathroom/ensuites)
-# New: 'primary_diff' for ΔT safeguards
+# HOUSE_CONFIG (unchanged from prior—persistent_zones defined)
 HOUSE_CONFIG = {
     'rooms': { 'lounge': 19.48, 'open_plan': 42.14, 'utility': 3.40, 'cloaks': 2.51,
         'bed1': 18.17, 'bed2': 13.59, 'bed3': 11.07, 'bed4': 9.79, 'bathroom': 6.02, 'ensuite1': 6.38, 'ensuite2': 3.71,
