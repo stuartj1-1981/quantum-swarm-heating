@@ -61,26 +61,17 @@ def set_ha_service(domain, service, data):
         for eid in entity_id:
             data_single = data.copy()
             data_single['entity_id'] = eid
-            _post_with_retry(domain, service, data_single, headers)
+            try:
+                r = requests.post(f"{HA_URL}/services/{domain}/{service}", headers=headers, json=data_single)
+                r.raise_for_status()
+            except Exception as e:
+                logging.error(f"HA set error for {eid}: {e}")
     else:
-        _post_with_retry(domain, service, data, headers)
-
-def _post_with_retry(domain, service, data, headers):
-    for attempt in range(3):
         try:
             r = requests.post(f"{HA_URL}/services/{domain}/{service}", headers=headers, json=data)
             r.raise_for_status()
-            return
-        except requests.exceptions.HTTPError as e:
-            if r.status_code == 500 and attempt < 2:
-                logging.warning(f"500 error on {domain}.{service}—retrying in 5s...")
-                time.sleep(5)
-            else:
-                logging.error(f"HA set error for {data.get('entity_id') or data.get('device_id')}: {e}")
-                return
         except Exception as e:
-            logging.error(f"HA set error for {data.get('entity_id') or data.get('device_id')}: {e}")
-            return
+            logging.error(f"HA set error for {entity_id or data.get('device_id')}: {e}")
 
 # HOUSE_CONFIG (unchanged from prior—persistent_zones defined)
 HOUSE_CONFIG = {
