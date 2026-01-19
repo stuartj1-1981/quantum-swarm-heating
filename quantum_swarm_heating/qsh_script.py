@@ -38,7 +38,7 @@ def fetch_ha_entity(entity_id, attr=None):
     if not HA_TOKEN:
         return None
     headers = {
-    "Authorization": f"Bearer {SUPERVISOR_TOKEN}",
+    "Authorization": f"Bearer {HA_TOKEN}",
     "Content-Type": "application/json"
 }
     try:
