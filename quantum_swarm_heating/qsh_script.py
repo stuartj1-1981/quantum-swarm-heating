@@ -168,7 +168,7 @@ def get_current_rate(rates):
             start_dt = datetime.fromisoformat(start)
             end_dt = datetime.fromisoformat(end)
             if start_dt <= now < end_dt:
-                return price / 100
+                return price
         except ValueError as e:
             logging.warning(f"Invalid date in rates: {e} — skipping entry.")
     return HOUSE_CONFIG['fallback_rates']['standard']
@@ -300,7 +300,7 @@ def sim_step(graph, states, config, model, optimizer):
 
         all_rates = current_day_parsed + next_day_parsed
         current_rate = get_current_rate(all_rates)
-        next_cheap = min(price for _, _, price in all_rates) / 100 if all_rates else config['fallback_rates']['cheap']
+        next_cheap = min(price for _, _, price in all_rates)  if all_rates else config['fallback_rates']['cheap']
 
         production = float(fetch_ha_entity(config['entities']['solar_production']) or 0)
         solar_gain = calc_solar_gain(config, production)
