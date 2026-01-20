@@ -117,7 +117,8 @@ HOUSE_CONFIG = {
         'dfan_control_toggle': 'input_boolean.dfan_control',
         'pid_target_temperature': 'input_number.pid_target_temperature',  # Added for dynamic target_temp
         'grid_power': 'sensor.givtcp_ce2029g082_grid_power',  # Added for grid power integration
-        'primary_diff': 'sensor.primary_diff'  # New for ΔT safeguards
+        'primary_diff': 'sensor.primary_diff',  # New for ΔT safeguards
+        'hp_flow_temp': 'sensor.octopus_energy_heat_pump_00_1e_5e_09_02_b6_88_31_flow_temperature'  # Assumed entity for current flow temp
     },
     'zone_sensor_map': { 'hall': 'independent_sensor01', 'bed1': 'independent_sensor02', 'landing': 'independent_sensor03', 'open_plan': 'independent_sensor04',
         'utility': 'independent_sensor01', 'cloaks': 'independent_sensor01', 'bed2': 'independent_sensor02', 'bed3': 'independent_sensor03', 'bed4': 'independent_sensor03',
@@ -146,6 +147,16 @@ HOUSE_CONFIG = {
         'device_id': 'b680894cd18521f7c706f1305b7333ea'
     }
 }
+
+# Cycle detection constants
+MIN_MODULATION_POWER = 0.20  # kW
+LOW_POWER_MIN_IGNORE = 300  # seconds (5 min initial ignore for cycles)
+LOW_POWER_MAX_TOLERANCE = 1800  # seconds (30 min max before forced boost)
+FLOW_TEMP_SPIKE_THRESHOLD = 2.0  # °C increase to detect oil recovery ramp
+POWER_SPIKE_THRESHOLD = 0.5  # kW increase to detect ramp
+FLOW_TEMP_DROP_THRESHOLD = -2.0  # °C decrease to detect defrost
+COP_DROP_THRESHOLD = -0.5  # COP drop to confirm defrost (sudden efficiency dip)
+COP_SPIKE_THRESHOLD = 0.5  # COP spike to confirm oil recovery (brief efficiency gain from ramp)
 
 # Merge user options (optional for now, as hardcoded; can re-enable for deployability)
 
@@ -340,12 +351,6 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         smoothed_demand = sum(demand_history) / len(demand_history)
         total_demand_adjusted = max(0, smoothed_demand - excess_solar + max(0, -discharge_rate)) + max(0, grid_power)
 
-        cop_value = fetch_ha_entity(config['entities']['hp_cop'])
-        live_cop = float(cop_value) if cop_value and cop_value != 'unavailable' else 3.5
-        if live_cop <= 0:
-            live_cop = 3.5
-            logging.warning("Live COP was <=0; using fallback 3.5")
-
         # Updated: DFAN ΔT safeguard <1.0°C with persistence
         global low_delta_persist
         delta_t = float(fetch_ha_entity(config['entities']['primary_diff']) or 3.0)
@@ -390,11 +395,60 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             if excess_solar > 1:
                 logging.info("Would have used 'auto' in old logic—defaulting to 'off' for QSH control.")
 
-        # Updated: Min mod check <0.20kW (after mode decision)
-        if hp_power < 0.20 and smoothed_demand > 0:
-            optimal_mode = 'off'  # Standby to avoid sub-min mod
-            target_temp -= 0.5  # Temporary drop
-            logging.info(f"DFAN min mod safeguard: Switched to 'off' (HP power: {hp_power:.2f}kW <0.20kW)")
+        # Fetch current flow temp and COP for cycle detection
+        current_flow_temp = float(fetch_ha_entity(config['entities']['hp_flow_temp']) or 35.0)
+        cop_value = fetch_ha_entity(config['entities']['hp_cop'])
+        live_cop = float(cop_value) if cop_value and cop_value != 'unavailable' else 3.5
+
+        # Min Modulation with Cycle Detection (Oil Recovery/Defrost) - replaces old min mod check
+        global low_power_start_time, prev_hp_power, prev_flow_temp, prev_cop, cycle_type
+        current_time = time.time()
+        power_delta = hp_power - prev_hp_power
+        flow_delta = current_flow_temp - prev_flow_temp
+        cop_delta = live_cop - prev_cop
+        
+        if hp_power < MIN_MODULATION_POWER and smoothed_demand > 0:
+            if low_power_start_time is None:
+                low_power_start_time = current_time
+                logging.info("Low HP power detected: Monitoring for cycle patterns...")
+            
+            time_in_low = current_time - low_power_start_time
+            
+            if time_in_low > LOW_POWER_MIN_IGNORE:
+                # Check for patterns after initial ignore window
+                if flow_delta <= FLOW_TEMP_DROP_THRESHOLD or cop_delta <= COP_DROP_THRESHOLD:
+                    cycle_type = 'defrost'
+                    logging.info(f"Defrost cycle detected: Flow delta {flow_delta:.2f}°C / COP delta {cop_delta:.2f}. Allowing...")
+                elif power_delta >= POWER_SPIKE_THRESHOLD or flow_delta >= FLOW_TEMP_SPIKE_THRESHOLD or cop_delta >= COP_SPIKE_THRESHOLD:
+                    cycle_type = 'oil_recovery'
+                    logging.info(f"Oil recovery cycle detected: Power delta {power_delta:.2f}kW / Flow delta {flow_delta:.2f}°C / COP delta {cop_delta:.2f}. Allowing...")
+                
+                if cycle_type:
+                    # During confirmed cycle: Skip safeguards, use fallback COP
+                    live_cop = 3.5
+                    logging.info(f"Using fallback COP 3.5 during confirmed cycle ({cycle_type})")
+                elif time_in_low > LOW_POWER_MAX_TOLERANCE:
+                    # No cycle detected, persistent low: Boost demand
+                    optimal_flow += 2.0  # Boost flow as demand boost
+                    optimal_flow = min(optimal_flow, flow_max)
+                    low_power_start_time = None
+                    cycle_type = None
+                    logging.warning("Persistent low HP power without cycle patterns: Boosting demand")
+        else:
+            if low_power_start_time:
+                logging.info(f"HP power recovered: Ending monitor (cycle: {cycle_type or 'none'})")
+            low_power_start_time = None
+            cycle_type = None
+        
+        # Update prev for next loop
+        prev_hp_power = hp_power
+        prev_flow_temp = current_flow_temp
+        prev_cop = live_cop
+
+        # COP fallback if <=0 outside cycles
+        if live_cop <= 0 and not cycle_type:
+            live_cop = 3.5
+            logging.warning("Live COP was <=0; using fallback 3.5")
 
         # Debug logging for mode decision
         logging.info(f"Mode decision: optimal_mode='{optimal_mode}', total_demand={smoothed_demand:.2f} kW, "
@@ -524,6 +578,11 @@ train_rl(graph, states, HOUSE_CONFIG, model, optimizer)
 # Initialize globals for refinements
 demand_history = deque(maxlen=3)
 low_delta_persist = 0
+low_power_start_time = None
+prev_hp_power = 0.0
+prev_flow_temp = 0.0
+prev_cop = 3.5  # New: Track previous COP
+cycle_type = None
 action_counter = 0
 prev_flow = 35.0
 prev_mode = 'off'
