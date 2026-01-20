@@ -118,7 +118,7 @@ HOUSE_CONFIG = {
         'pid_target_temperature': 'input_number.pid_target_temperature',  # Added for dynamic target_temp
         'grid_power': 'sensor.givtcp_ce2029g082_grid_power',  # Added for grid power integration
         'primary_diff': 'sensor.primary_diff',  # New for ΔT safeguards
-        'hp_flow_temp': 'sensor.octopus_energy_heat_pump_00_1e_5e_09_02_b6_88_31_flow_temperature'  # Assumed entity for current flow temp
+        'hp_flow_temp': 'sensor.primary_flow_temperature'  
     },
     'zone_sensor_map': { 'hall': 'independent_sensor01', 'bed1': 'independent_sensor02', 'landing': 'independent_sensor03', 'open_plan': 'independent_sensor04',
         'utility': 'independent_sensor01', 'cloaks': 'independent_sensor01', 'bed2': 'independent_sensor02', 'bed3': 'independent_sensor03', 'bed4': 'independent_sensor03',
