@@ -9,11 +9,15 @@ import logging
 import os
 import json
 import requests
-from collections import defaultdict, deque  # Added deque for smoothing
+from collections import defaultdict, deque
+import signal
+import sys
+import numpy as np
+import matplotlib.pyplot as plt  # For plots if enabled
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load user options (optional for now, as hardcoded; can re-enable for deployability)
+# Load user options
 try:
     with open('/data/options.json', 'r') as f:
         user_options = json.load(f)
@@ -21,9 +25,9 @@ except Exception as e:
     logging.warning(f"Failed to load options.json: {e}. Using defaults.")
     user_options = {}
 
-logging.info(f"Loaded user_options: {user_options}")  # Debug
+logging.info(f"Loaded user_options: {user_options}")
 
-# HA API setup (use SUPERVISOR_TOKEN for internal add-on access)
+# HA API setup
 HA_URL = 'http://supervisor/core/api'
 HA_TOKEN = os.getenv('SUPERVISOR_TOKEN')
 
@@ -73,7 +77,7 @@ def set_ha_service(domain, service, data):
         except Exception as e:
             logging.error(f"HA set error for {entity_id or data.get('device_id')}: {e}")
 
-# HOUSE_CONFIG (unchanged from prior—persistent_zones defined)
+# HOUSE_CONFIG
 HOUSE_CONFIG = {
     'rooms': { 'lounge': 19.48, 'open_plan': 42.14, 'utility': 3.40, 'cloaks': 2.51,
         'bed1': 18.17, 'bed2': 13.59, 'bed3': 11.07, 'bed4': 9.79, 'bathroom': 6.02, 'ensuite1': 6.38, 'ensuite2': 3.71,
@@ -83,7 +87,7 @@ HOUSE_CONFIG = {
         'hall': 0.2, 'landing': 0.2 },
     'entities': {
         'lounge_temp_set_hum': 'climate.tado_smart_radiator_thermostat_va4240580352',
-        'open_plan_temp_set_hum': ['climate.tado_smart_radiator_thermostat_va0349246464', 'climate.tado_smart_radiator_thermostat_va3553629184'],  # Dining and family room; add kitchen if separate (updated key)
+        'open_plan_temp_set_hum': ['climate.tado_smart_radiator_thermostat_va0349246464', 'climate.tado_smart_radiator_thermostat_va3553629184'],
         'utility_temp_set_hum': 'climate.tado_smart_radiator_thermostat_va1604136448',
         'cloaks_temp_set_hum': 'climate.tado_smart_radiator_thermostat_va0949825024',
         'bed1_temp_set_hum': 'climate.tado_smart_radiator_thermostat_va1287620864',
@@ -115,9 +119,9 @@ HOUSE_CONFIG = {
         'flow_max_temp': 'input_number.flow_max_temperature',
         'hp_cop': 'sensor.live_cop_calc',
         'dfan_control_toggle': 'input_boolean.dfan_control',
-        'pid_target_temperature': 'input_number.pid_target_temperature',  # Added for dynamic target_temp
-        'grid_power': 'sensor.givtcp_ce2029g082_grid_power',  # Added for grid power integration
-        'primary_diff': 'sensor.primary_diff',  # New for ΔT safeguards
+        'pid_target_temperature': 'input_number.pid_target_temperature',
+        'grid_power': 'sensor.givtcp_ce2029g082_grid_power',
+        'primary_diff': 'sensor.primary_diff',
         'hp_flow_temp': 'sensor.primary_flow_temperature'  
     },
     'zone_sensor_map': { 'hall': 'independent_sensor01', 'bed1': 'independent_sensor02', 'landing': 'independent_sensor03', 'open_plan': 'independent_sensor04',
@@ -127,12 +131,12 @@ HOUSE_CONFIG = {
     'grid': {'nominal_voltage': 230.0, 'min_voltage': 200.0, 'max_voltage': 250.0},
     'fallback_rates': {'cheap': 0.1495, 'standard': 0.3048, 'peak': 0.4572, 'export': 0.15},
     'inverter': {'fallback_efficiency': 0.95},
-    'peak_loss': 5.0,  # Reverted to 5.0 kW @ -3°C based on real world data from previous conversations
-    'design_target': 21.0,  # Design internal temp for peak_loss calc
-    'peak_ext': -3.0,       # Design external temp for peak_loss
-    'thermal_mass_per_m2': 0.03,  # kWh/(m² °C), typical value based on residential buildings
-    'heat_up_tau_h': 1.0,  # Desired heat-up time in hours for temperature deficits
-    'persistent_zones': ['bathroom', 'ensuite1', 'ensuite2'],  # New for always-open balancing
+    'peak_loss': 5.0,
+    'design_target': 21.0,
+    'peak_ext': -3.0,
+    'thermal_mass_per_m2': 0.03,
+    'heat_up_tau_h': 1.0,
+    'persistent_zones': ['bathroom', 'ensuite1', 'ensuite2'],
     'hp_flow_service': {
         'domain': 'octopus_energy',
         'service': 'set_heat_pump_flow_temp_config',
@@ -148,17 +152,21 @@ HOUSE_CONFIG = {
     }
 }
 
-# Cycle detection constants
-MIN_MODULATION_POWER = 0.20  # kW
-LOW_POWER_MIN_IGNORE = 300  # seconds (5 min initial ignore for cycles)
-LOW_POWER_MAX_TOLERANCE = 1800  # seconds (30 min max before forced boost)
-FLOW_TEMP_SPIKE_THRESHOLD = 2.0  # °C increase to detect oil recovery ramp
-POWER_SPIKE_THRESHOLD = 0.5  # kW increase to detect ramp
-FLOW_TEMP_DROP_THRESHOLD = -2.0  # °C decrease to detect defrost
-COP_DROP_THRESHOLD = -0.5  # COP drop to confirm defrost (sudden efficiency dip)
-COP_SPIKE_THRESHOLD = 0.5  # COP spike to confirm oil recovery (brief efficiency gain from ramp)
+# Cycle detection constants - updated thresholds for boosted sensitivity
+MIN_MODULATION_POWER = 0.20
+LOW_POWER_MIN_IGNORE = 180  # Reduced to 180s
+LOW_POWER_MAX_TOLERANCE = 1800
+FLOW_TEMP_SPIKE_THRESHOLD = 1.5  # Lowered
+POWER_SPIKE_THRESHOLD = 0.3  # Lowered
+FLOW_TEMP_DROP_THRESHOLD = -1.5  # Lowered abs for sensitivity
+COP_DROP_THRESHOLD = -0.3  # Lowered
+COP_SPIKE_THRESHOLD = 0.3  # Lowered
+DEMAND_DELTA_THRESHOLD = 1.5  # Added for Δdemand
+LOSS_DELTA_THRESHOLD = 0.5  # Added for loss spikes (kW)
+EXTENDED_RECOVERY_TIME = 300  # For extended pauses
 
-# Merge user options (optional for now, as hardcoded; can re-enable for deployability)
+# Global for persisted rates
+prev_all_rates = []
 
 def parse_rates_array(rates_list):
     if not rates_list or not isinstance(rates_list, list) or len(rates_list) == 0:
@@ -202,7 +210,7 @@ def build_dfan_graph(config):
     G = nx.Graph()
     for room in config['rooms']:
         G.add_node(room, area=config['rooms'][room], facing=config['facings'][room])
-    G.add_edges_from([('lounge', 'hall'), ('open_plan', 'utility')])  # Updated edge for renamed room
+    G.add_edges_from([('lounge', 'hall'), ('open_plan', 'utility')])
     return G
 
 class SimpleQNet(nn.Module):
@@ -230,14 +238,57 @@ def train_rl(graph, states, config, model, optimizer, episodes=500):
         optimizer.step()
     logging.info("Initial RL training complete.")
 
+# Globals for refinements
+demand_history = deque(maxlen=5)  # Extended to 5
+prod_history = deque(maxlen=5)
+grid_history = deque(maxlen=5)
+low_delta_persist = 0
+low_power_start_time = None
+prev_hp_power = 0.0
+prev_flow_temp = 0.0
+prev_cop = 3.5
+cycle_type = None
+cycle_start = None
+action_counter = 0
+prev_flow = 35.0
+prev_mode = 'off'
+prev_demand = 0.0
+prev_time = time.time()
+prev_actual_loss = 0.0
+reward_history = deque(maxlen=1000)
+loss_history = deque(maxlen=1000)
+pause_count = 0
+undetected_count = 0
+enable_plots = user_options.get('enable_plots', False)
+
+def shutdown_handler(sig, frame):
+    mean_reward = sum(reward_history) / len(reward_history) if reward_history else 0
+    mean_loss = sum(loss_history) / len(loss_history) if loss_history else 0
+    demand_list = list(demand_history)
+    demand_std = np.std(demand_list) if demand_list else 0
+    logging.info(f"Shutdown summary: mean_reward={mean_reward:.2f}, mean_loss={mean_loss:.2f}, pause_count={pause_count}, demand_std={demand_std:.2f}, undetected_events={undetected_count}")
+    if enable_plots and demand_list:
+        plt.plot(demand_list)
+        plt.title('Demand History')
+        plt.xlabel('Steps')
+        plt.ylabel('Demand (kW)')
+        plt.savefig('/data/demand_hist.png')
+        logging.info("Demand history plot saved to /data/demand_hist.png")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, shutdown_handler)
+signal.signal(signal.SIGTERM, shutdown_handler)
+
 def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow, prev_mode, prev_demand):
-    global low_delta_persist, low_power_start_time, prev_hp_power, prev_flow_temp, prev_cop, cycle_type, demand_history, prod_history, grid_history
+    global low_delta_persist, low_power_start_time, prev_hp_power, prev_flow_temp, prev_cop, cycle_type, demand_history, prod_history, grid_history, prev_time, cycle_start, prev_actual_loss, pause_count, undetected_count
     try:
+        current_time = time.time()
+        time_delta = current_time - prev_time
         dfan_control = fetch_ha_entity(config['entities']['dfan_control_toggle']) == 'on'
         ext_temp = float(fetch_ha_entity(config['entities']['outdoor_temp']) or 0.0)
         wind_speed = float(fetch_ha_entity(config['entities']['forecast_weather'], 'wind_speed') or 0.0)
         chill_factor = 1.0
-        target_temp = float(fetch_ha_entity(config['entities']['pid_target_temperature']) or 21.0) # Fetch from entity
+        target_temp = float(fetch_ha_entity(config['entities']['pid_target_temperature']) or 21.0)
         logging.info(f"Using target_temp: {target_temp}°C from pid_target_temperature.")
         delta = target_temp - ext_temp
         if wind_speed > 5:
@@ -246,61 +297,42 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             chill_factor = 1.0 + (chill_delta / max(1, delta))
         logging.info(f"Computed chill_factor: {chill_factor:.2f} based on wind {wind_speed} km/h")
         
-        # Compute loss_coeff and sum_af here
         loss_coeff = config['peak_loss'] / (config['design_target'] - config['peak_ext']) if (config['design_target'] > config['peak_ext']) else 0.0
         sum_af = sum(config['rooms'][r] * config['facings'][r] for r in config['rooms'])
         logging.info(f"Computed loss_coeff: {loss_coeff:.3f} kW/°C, sum_af: {sum_af:.3f}")
         
-        # Forecast with try-except for robustness
-        try:
-            forecast = fetch_ha_entity(config['entities']['forecast_weather'], 'forecast') or []
-            forecast_temps = [f['temperature'] for f in forecast if 'temperature' in f and (datetime.fromisoformat(f['datetime']) - datetime.now()) < timedelta(hours=24)]
-            forecast_min_temp = min(forecast_temps) if forecast_temps else ext_temp
-            upcoming_cold = any(f['temperature'] < 5 
-                                for f in forecast 
-                                if 'temperature' in f 
-                                and (datetime.fromisoformat(f['datetime']) - datetime.now()) < timedelta(hours=12))
-        except Exception as e:
-            logging.warning(f"Forecast fetch error: {e} — assuming no upcoming cold.")
-            forecast_min_temp = ext_temp
-            upcoming_cold = False
-
-        # Fetch raw mode
-        operation_mode = fetch_ha_entity(
-            config['entities']['water_heater'],
-            'operation_mode'
-        )
-
-        # Normalise against known valid modes
+        forecast = fetch_ha_entity(config['entities']['forecast_weather'], 'forecast') or []
+        forecast_temps = [f['temperature'] for f in forecast if 'temperature' in f and (datetime.fromisoformat(f['datetime']) - datetime.now()) < timedelta(hours=24)]
+        forecast_min_temp = min(forecast_temps) if forecast_temps else ext_temp
+        upcoming_cold = any(f['temperature'] < 5 for f in forecast if 'temperature' in f and (datetime.fromisoformat(f['datetime']) - datetime.now()) < timedelta(hours=12))
+        forecast_winds = [f['wind_speed'] for f in forecast if 'wind_speed' in f and (datetime.fromisoformat(f['datetime']) - datetime.now()) < timedelta(hours=12)]
+        upcoming_high_wind = any(w > 20 for w in forecast_winds)
+        
+        operation_mode = fetch_ha_entity(config['entities']['water_heater'], 'operation_mode')
         valid_modes = {'electric', 'off', 'heat_pump', 'high_demand'}
         if operation_mode not in valid_modes:
             operation_mode = 'off'
             logging.warning("Unknown operation_mode—defaulting to 'off'.")
-
-        # Detect high-demand mode
         hot_water_active = operation_mode == 'high_demand'
-
         if hot_water_active:
             logging.info("Hot water cycle active—pausing space heating sets.")
+            pause_count += 1
             return action_counter + 1, prev_flow, prev_mode, prev_demand
 
-        # Build zone groups
         sensor_to_rooms = defaultdict(list)
         for room, sensor_key in config['zone_sensor_map'].items():
             sensor_to_rooms[sensor_key].append(room)
 
-        # Fetch zone temps and compute offsets
         zone_temps = {}
-        zone_offsets = {}  # For setpoints, per room
+        zone_offsets = {}
         for sensor_key, rooms_list in sensor_to_rooms.items():
             sensor_entity = config['entities'].get(sensor_key)
             if sensor_entity:
                 zone_temp = float(fetch_ha_entity(sensor_entity) or target_temp)
                 zone_temps[sensor_key] = zone_temp
                 for room in rooms_list:
-                    zone_offsets[room] = target_temp - zone_temp  # Same offset for all rooms in zone
+                    zone_offsets[room] = target_temp - zone_temp
 
-        # Compute actual_loss and heat_up_power
         actual_loss = 0.0
         heat_up_power = 0.0
         for sensor_key, rooms_list in sensor_to_rooms.items():
@@ -313,15 +345,17 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             heat_up = (deficit * zone_mass) / config['heat_up_tau_h']
             heat_up_power += heat_up
 
-        # Rates with fallback
         current_day_rates_list = fetch_ha_entity(config['entities']['current_day_rates']) or []
         next_day_rates_list = fetch_ha_entity(config['entities']['next_day_rates']) or []
         current_day_parsed = parse_rates_array(current_day_rates_list)
         next_day_parsed = parse_rates_array(next_day_rates_list)
-
         all_rates = current_day_parsed + next_day_parsed
+        if not all_rates:
+            all_rates = prev_all_rates
+        else:
+            prev_all_rates[:] = all_rates  # Update global
         current_rate = get_current_rate(all_rates)
-        next_cheap = min(price for _, _, price in all_rates)  if all_rates else config['fallback_rates']['cheap']
+        next_cheap = min(price for _, _, price in all_rates) if all_rates else config['fallback_rates']['cheap']
 
         production = float(fetch_ha_entity(config['entities']['solar_production']) or 0)
         prod_history.append(production)
@@ -331,33 +365,30 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         total_demand = actual_loss + heat_up_power - solar_gain
 
         soc = float(fetch_ha_entity(config['entities']['battery_soc']) or 50.0)
-        charge_rate = 0.0
-        discharge_rate = 0.0
-        
-        # Fetch grid power (positive: export, negative: import)
         grid_power = float(fetch_ha_entity(config['entities']['grid_power']) or 0.0)
         grid_history.append(grid_power)
         smoothed_grid = sum(grid_history) / len(grid_history)
         logging.info(f"Fetched grid_power: {grid_power:.2f} W, Smoothed: {smoothed_grid:.2f} W")
         logging.info(f"Fetched solar_production: {production:.2f} kW, Smoothed: {smoothed_prod:.2f} kW")
 
-        # New: Demand smoothing
         demand_history.append(total_demand)
         smoothed_demand = sum(demand_history) / len(demand_history)
 
-        # Revised: total_demand_adjusted
-        import_kw = max(0, -smoothed_grid / 1000.0)  # If negative grid (import), positive kW
-        export_kw = max(0, smoothed_grid / 1000.0)  # If positive, export kW
+        import_kw = max(0, -smoothed_grid / 1000.0)
+        export_kw = max(0, smoothed_grid / 1000.0)
         total_demand_adjusted = max(0, smoothed_demand - excess_solar - export_kw + import_kw)
 
-        # Guard against large swings
-        if abs(total_demand_adjusted - prev_demand) > 2.0:
-            logging.warning(f"Input anomaly detected: Demand swing {total_demand_adjusted:.2f} from {prev_demand:.2f} kW—using fallback.")
-            total_demand_adjusted = (total_demand_adjusted + prev_demand) / 2.0  # Average or prev
+        demand_delta = total_demand_adjusted - prev_demand
+        logging.info(f"Δdemand: {demand_delta:.2f} kW")
+        if total_demand_adjusted > 20:
+            total_demand_adjusted = 3.5
+            logging.warning("Anomaly: demand >20 kW, fallback to 3.5 kW")
+        elif abs(demand_delta) > 2.0:
+            logging.warning(f"Input anomaly detected: Demand swing {total_demand_adjusted:.2f} from {prev_demand:.2f} kW—using average.")
+            total_demand_adjusted = (total_demand_adjusted + prev_demand) / 2.0
 
-        # Updated: DFAN ΔT safeguard <1.0°C with persistence
         delta_t = float(fetch_ha_entity(config['entities']['primary_diff']) or 3.0)
-        hp_power = float(fetch_ha_entity(config['entities']['hp_energy_rate']) or 0.0)  # kW
+        hp_power = float(fetch_ha_entity(config['entities']['hp_energy_rate']) or 0.0)
         if delta_t < 1.0:
             low_delta_persist += 1
             if low_delta_persist >= 2:
@@ -368,126 +399,181 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         flow_min = float(fetch_ha_entity(config['entities']['flow_min_temp']) or 32.0)
         flow_max = float(fetch_ha_entity(config['entities']['flow_max_temp']) or 50.0)
         optimal_flow = max(flow_min, min(flow_max, 35 + (smoothed_demand / config['peak_loss'] * (flow_max - 35))))
-        
-        # DFAN WC cap (low limit 30°C as requested)
-        wc_cap = min(45, max(30, 50 - (ext_temp * 1.2)))  # Tune multiplier
+        wc_cap = min(50, max(30, 50 - (ext_temp * 1.2)))
         optimal_flow = min(optimal_flow, wc_cap)
         logging.info(f"DFAN WC applied: Capped flow to {optimal_flow:.1f}°C for ext_temp {ext_temp:.1f}°C")
         
-        # Apply ΔT boost if persistent (after capping)
         if low_delta_persist >= 2:
             optimal_flow += 2.0
             optimal_flow = min(optimal_flow, flow_max)
             logging.info(f"DFAN ΔT safeguard: Boosted flow by 2°C (persistent ΔT: {delta_t:.1f}°C)")
 
-        # Fix Octopus GraphQL serializer validation (KT-CT-4321) – too many float digits
         optimal_flow = round(optimal_flow, 1)
         flow_min = round(flow_min, 1)
         flow_max = round(flow_max, 1)
         logging.info(f"Rounded optimal_flow: {optimal_flow:.1f}°C, flow_min: {flow_min:.1f}°C, flow_max: {flow_max:.1f}°C")
         
-        # MODIFIED: Binary mode choice only ('heat' or 'off') to avoid HP internal schedule
-        optimal_mode = 'heat'  # Default assume heat
-        if smoothed_demand > 1.5 or ext_temp < 5 or (upcoming_cold and current_rate < 0.15):
-            optimal_mode = 'heat'  # Prioritize heat for demand/cold/cheap proactive scenarios
+        flow_delta = optimal_flow - prev_flow
+        flow_ramp_rate = abs(flow_delta) / (time_delta / 60) if time_delta > 0 else 0
+        
+        optimal_mode = 'heat'
+        if smoothed_demand > 1.5 or ext_temp < 5 or (upcoming_cold and current_rate < 0.15) or (upcoming_high_wind and current_rate < 0.15):
+            optimal_mode = 'heat'
             if upcoming_cold and current_rate < 0.15:
                 optimal_flow += 5
                 logging.info("Proactive heating enabled due to forecast cold snap.")
+            if upcoming_high_wind and current_rate < 0.15:
+                optimal_flow += 3
+                logging.info("Proactive heating enabled due to forecast high wind.")
         else:
-            optimal_mode = 'off'  # Default to off (e.g., excess solar or low demand)
+            optimal_mode = 'off'
             if excess_solar > 1:
                 logging.info("Would have used 'auto' in old logic—defaulting to 'off' for QSH control.")
-
-        # Fetch current flow temp and COP for cycle detection
+        
+        if soc > 80 and export_kw > 1 and current_rate > 0.3:
+            optimal_mode = 'off'
+            logging.info("Export optimized pause: high SOC and export during peak rate")
+        
         current_flow_temp = float(fetch_ha_entity(config['entities']['hp_flow_temp']) or 35.0)
         cop_value = fetch_ha_entity(config['entities']['hp_cop'])
-        live_cop = float(cop_value) if cop_value and cop_value != 'unavailable' else prev_cop
+        if cop_value == 'unavailable':
+            cop_value = fetch_ha_entity(config['entities']['hp_cop'])  # Redundancy
+        if cop_value == 'unavailable':
+            logging.warning("COP gap - potential undetected cycle")
+            undetected_count += 1
+            live_cop = prev_cop
+        else:
+            live_cop = float(cop_value) if cop_value else prev_cop
 
-        # Min Modulation with Cycle Detection (Oil Recovery/Defrost) - replaces old min mod check
-        current_time = time.time()
         power_delta = hp_power - prev_hp_power
-        flow_delta = current_flow_temp - prev_flow_temp
+        flow_delta_actual = current_flow_temp - prev_flow_temp  # Actual flow delta
         cop_delta = live_cop - prev_cop
+        loss_delta = actual_loss - prev_actual_loss
+        
+        # Standalone cycle detection
+        if flow_delta_actual <= FLOW_TEMP_DROP_THRESHOLD or cop_delta <= COP_DROP_THRESHOLD or demand_delta <= -DEMAND_DELTA_THRESHOLD or loss_delta <= -LOSS_DELTA_THRESHOLD:
+            cycle_type = 'defrost'
+            if cycle_start is None:
+                cycle_start = current_time
+            logging.info(f"Defrost cycle detected: Flow delta {flow_delta_actual:.2f}°C / COP delta {cop_delta:.2f} / Demand delta {demand_delta:.2f} / Loss delta {loss_delta:.2f}")
+        elif power_delta >= POWER_SPIKE_THRESHOLD or flow_delta_actual >= FLOW_TEMP_SPIKE_THRESHOLD or cop_delta >= COP_SPIKE_THRESHOLD or demand_delta >= DEMAND_DELTA_THRESHOLD or loss_delta >= LOSS_DELTA_THRESHOLD:
+            cycle_type = 'oil_recovery'
+            if cycle_start is None:
+                cycle_start = current_time
+            logging.info(f"Oil recovery cycle detected: Power delta {power_delta:.2f}kW / Flow delta {flow_delta_actual:.2f}°C / COP delta {cop_delta:.2f} / Demand delta {demand_delta:.2f} / Loss delta {loss_delta:.2f}")
+        else:
+            cycle_type = None
+            cycle_start = None
         
         if hp_power < MIN_MODULATION_POWER and smoothed_demand > 0:
             if low_power_start_time is None:
                 low_power_start_time = current_time
                 logging.info("Low HP power detected: Monitoring for cycle patterns...")
-            
             time_in_low = current_time - low_power_start_time
-            
-            if time_in_low > LOW_POWER_MIN_IGNORE:
-                if flow_delta <= FLOW_TEMP_DROP_THRESHOLD or cop_delta <= COP_DROP_THRESHOLD:
-                    cycle_type = 'defrost'
-                    logging.info(f"Defrost cycle detected: Flow delta {flow_delta:.2f}°C / COP delta {cop_delta:.2f}. Pausing...")
-                elif power_delta >= POWER_SPIKE_THRESHOLD or flow_delta >= FLOW_TEMP_SPIKE_THRESHOLD or cop_delta >= COP_SPIKE_THRESHOLD:
-                    cycle_type = 'oil_recovery'
-                    logging.info(f"Oil recovery cycle detected: Power delta {power_delta:.2f}kW / Flow delta {flow_delta:.2f}°C / COP delta {cop_delta:.2f}. Pausing...")
-                
-                if cycle_type:
-                    # NEW: Pause like hot water
-                    logging.info(f"Cycle pause: Type {cycle_type}, duration {time_in_low:.0f}s—pausing adjustments.")
-                    return action_counter + 1, prev_flow, prev_mode, prev_demand  # Skip updates/RL/sets
-                
-                elif time_in_low > LOW_POWER_MAX_TOLERANCE:
-                    optimal_flow += 2.0  # Boost flow as demand boost
-                    optimal_flow = min(optimal_flow, flow_max)
-                    low_power_start_time = None
-                    cycle_type = None
-                    logging.warning("Persistent low HP power without cycle patterns: Boosting demand")
+            if time_in_low > LOW_POWER_MIN_IGNORE and cycle_type:
+                time_in_cycle = current_time - cycle_start if cycle_start else 0
+                if time_in_cycle > EXTENDED_RECOVERY_TIME:
+                    logging.info(f"Extended recovery pause: Type {cycle_type}, duration {time_in_cycle:.0f}s")
+            if time_in_low > LOW_POWER_MAX_TOLERANCE:
+                optimal_flow += 2.0
+                optimal_flow = min(optimal_flow, flow_max)
+                low_power_start_time = None
+                logging.warning("Persistent low HP power without cycle patterns: Boosting demand")
         else:
             if low_power_start_time:
+                time_in_low = current_time - low_power_start_time
                 logging.info(f"HP power recovered: Ending monitor (cycle: {cycle_type or 'none'}, duration {time_in_low:.0f}s)")
             low_power_start_time = None
-            cycle_type = None
         
-        # NEW: COP check outside cycles—use prev if <=0
+        if abs(demand_delta) >= DEMAND_DELTA_THRESHOLD and not cycle_type:
+            logging.warning(f"Potential undetected cycle: large Δdemand {demand_delta:.2f} kW without patterns")
+            undetected_count += 1
+        
+        if cycle_type:
+            time_in_cycle = current_time - cycle_start if cycle_start else 0
+            logging.info(f"Cycle pause: Type {cycle_type}, duration {time_in_cycle:.0f}s—pausing adjustments.")
+            pause_count += 1
+            prev_time = current_time
+            prev_actual_loss = actual_loss
+            return action_counter + 1, prev_flow, prev_mode, prev_demand
+        
         if live_cop <= 0:
             logging.warning("Live COP <=0 outside cycle; using previous COP.")
             live_cop = prev_cop
 
-        # Update prev for next loop
         prev_hp_power = hp_power
         prev_flow_temp = current_flow_temp
         prev_cop = live_cop
 
-        # Debug logging for mode decision
         logging.info(f"Mode decision: optimal_mode='{optimal_mode}', total_demand={smoothed_demand:.2f} kW, "
-                     f"ext_temp={ext_temp:.1f}°C, upcoming_cold={upcoming_cold}, current_rate={current_rate:.3f} GBP/kWh, "
+                     f"ext_temp={ext_temp:.1f}°C, upcoming_cold={upcoming_cold}, upcoming_high_wind={upcoming_high_wind}, current_rate={current_rate:.3f} GBP/kWh, "
                      f"hot_water_active={hot_water_active}")
 
-        # Expand states to include grid_power, delta_t, hp_power (state_dim now 11)
-        states = torch.tensor([current_rate, soc, live_cop, optimal_flow, smoothed_demand, excess_solar, wind_speed, forecast_min_temp, smoothed_grid, delta_t, hp_power], dtype=torch.float32)
+        states = torch.tensor([current_rate, soc, live_cop, optimal_flow, smoothed_demand, excess_solar, wind_speed, forecast_min_temp, smoothed_grid, delta_t, hp_power, chill_factor], dtype=torch.float32)
 
         action = model.actor(states.unsqueeze(0))
-        reward = -current_rate * total_demand_adjusted / live_cop
+
+        # Reward adjustments from previous loss
+        reward_adjust = 0
+        if loss_history:
+            prev_loss = loss_history[-1]
+            if prev_loss > 100:
+                reward_adjust -= 0.4
+        if len(loss_history) >= 5 and sum(loss_history[-5:]) / 5 < 1:
+            reward_adjust += 0.4
+
+        # Base reward with scaling
+        reward = -0.8 * current_rate * total_demand_adjusted / live_cop
         reward += (live_cop - 3.0) * 0.5 - (abs(heat_up_power) * 0.1)
-        
-        # RL reward tweak for grid power (penalize imports during peaks, bonus for exports)
-        if current_rate > 0.3 and smoothed_grid < -500:  # Import >0.5 kW
-            reward -= abs(smoothed_grid / 1000.0) * current_rate * 0.2  # Cost hit for unoffset imports
-        elif smoothed_grid > 1000:  # Export >1 kW
-            reward += (smoothed_grid / 1000.0) * config['fallback_rates']['export'] * 0.1  # Export bonus
-        
-        # New: ΔT penalty in reward
-        reward -= max(0, 3.0 - delta_t) * 2.0  # Penalty if <3°C
+        reward += reward_adjust
 
-        # New: Penalize rapid flow changes
-        if abs(optimal_flow - prev_flow) > 2.0:
-            reward -= 0.3
+        volatile = abs(demand_delta) > 1.0
 
-        # Amped: Penalize rapid demand changes
-        if abs(total_demand_adjusted - prev_demand) > 1.0:
-            reward -= 0.5
+        # Penalties and bonuses
+        demand_penalty = 0.5 if abs(demand_delta) > 1.0 else 0
+        flow_penalty = 0.3 if abs(flow_delta) > 2.0 else 0
+        ramp_penalty = 0.3 if flow_ramp_rate > 1.5 else 0
+        dt_penalty = max(0, 3.0 - delta_t) * 2.0
+        grid_penalty = abs(smoothed_grid / 1000.0) * current_rate * 0.2 if current_rate > 0.3 and smoothed_grid < -500 else 0
+        export_bonus = (smoothed_grid / 1000.0) * config['fallback_rates']['export'] * 0.1 if smoothed_grid > 1000 else 0
+
+        if volatile:
+            demand_penalty *= 0.5
+            flow_penalty *= 0.5
+            ramp_penalty *= 0.5
+            dt_penalty *= 0.5
+            grid_penalty *= 0.5
+
+        reward -= (demand_penalty + flow_penalty + ramp_penalty + dt_penalty + grid_penalty)
+        reward += export_bonus
+
+        # Stability bonuses
+        if abs(demand_delta) < 0.5:
+            reward += 0.3
+        if abs(flow_delta) < 0.5:
+            reward += 0.2
 
         value = model.critic(states.unsqueeze(0))
         loss = (reward - value).pow(2).mean()
+
+        # Loss scaling for anomalies
+        if smoothed_demand > 50:
+            loss = loss * 0.5
+
         optimizer.zero_grad()
         loss.backward()
+
+        # Gradient clipping
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.data.clamp_(-10, 10)
+
         optimizer.step()
         logging.info(f"RL update: Reward {reward:.2f}, Loss {loss.item():.4f}")
 
-        # Conditional actions: Every 10 loops or urgent
+        reward_history.append(reward)
+        loss_history.append(loss.item())
+
         flow_delta = abs(optimal_flow - prev_flow)
         demand_delta = abs(smoothed_demand - prev_demand)
         urgent = (optimal_mode != prev_mode) or (flow_delta > 2.0) or (demand_delta > 0.5) or (low_delta_persist >= 2) or (hp_power < 0.20)
@@ -509,7 +595,6 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             mode_data = {'device_id': config['hp_hvac_service']['device_id'], 'hvac_mode': optimal_mode}
             set_ha_service(config['hp_hvac_service']['domain'], config['hp_hvac_service']['service'], mode_data)
             
-            # Updated: Set static 23°C only when mode='heat' (HP auto-handles 'off' to 7°C)
             if optimal_mode == 'heat':
                 temp_data = {'device_id': config['hp_hvac_service']['device_id'], 'temperature': 23.0}
                 set_ha_service('climate', 'set_temperature', temp_data)
@@ -519,60 +604,35 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         else:
             logging.info(f"Data gather: Shadow would set flow {optimal_flow:.1f}°C and mode {optimal_mode}. (Action in {10 - (action_counter % 10)} loops)")
 
-        # Shadow/preview entities (always, for dashboard consistency) with try-except for robustness
-        try:
-            clamped_demand = max(min(total_demand_adjusted, 10.0), 0.0)
-            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_total_demand', 'value': clamped_demand})
-        except Exception as e:
-            logging.warning(f"Shadow set failed for qsh_total_demand: {e}")
+        clamped_demand = max(min(total_demand_adjusted, 15.0), 0.0)
+        set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_total_demand', 'value': clamped_demand})
+        set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_shadow_flow', 'value': optimal_flow})
+        set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_shadow_mode', 'option': optimal_mode})
+        set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_optimal_mode', 'option': optimal_mode})
+        clamped_reward = max(min(reward, 100.0), -100.0)
+        set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_rl_reward', 'value': clamped_reward})
+        clamped_loss = max(min(loss.item(), 2000.0), 0.0)
+        set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_rl_loss', 'value': clamped_loss})
 
-        try:
-            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_shadow_flow', 'value': optimal_flow})
-        except Exception as e:
-            logging.warning(f"Shadow set failed for qsh_shadow_flow: {e}")
-
-        try:
-            set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_shadow_mode', 'option': optimal_mode})
-        except Exception as e:
-            logging.warning(f"Shadow set failed for qsh_shadow_mode: {e}")
-
-        try:
-            set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_optimal_mode', 'option': optimal_mode})
-        except Exception as e:
-            logging.warning(f"Shadow set failed for qsh_optimal_mode: {e}")
-
-        # RL metrics (with clamping to match entity min/max)
-        try:
-            clamped_reward = max(min(reward, 100.0), -100.0)
-            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_rl_reward', 'value': clamped_reward})
-        except Exception as e:
-            logging.warning(f"Shadow set failed for qsh_rl_reward: {e}")
-
-        try:
-            clamped_loss = max(min(loss.item(), 2000.0), 0.0)
-            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_rl_loss', 'value': clamped_loss})
-        except Exception as e:
-            logging.warning(f"Shadow set failed for qsh_rl_loss: {e}")
-
-        # Per-room shadow setpoints (with static override for persistent)
         for room in config['rooms']:
-            try:
-                shadow_setpoint = 25.0 if room in config['persistent_zones'] else target_temp + zone_offsets.get(room, 0)
-                entity_id = f'input_number.qsh_shadow_{room}_setpoint'
-                set_ha_service('input_number', 'set_value', {'entity_id': entity_id, 'value': shadow_setpoint})
-                if not dfan_control:
-                    logging.info(f"Shadow: Would set {room} to {shadow_setpoint:.1f}°C")  # Optional extra log for debug
-            except Exception as e:
-                logging.warning(f"Shadow set failed for qsh_shadow_{room}_setpoint: {e}")
+            shadow_setpoint = 25.0 if room in config['persistent_zones'] else target_temp + zone_offsets.get(room, 0)
+            entity_id = f'input_number.qsh_shadow_{room}_setpoint'
+            set_ha_service('input_number', 'set_value', {'entity_id': entity_id, 'value': shadow_setpoint})
+            if not dfan_control:
+                logging.info(f"Shadow: Would set {room} to {shadow_setpoint:.1f}°C")
 
+        prev_time = current_time
+        prev_actual_loss = actual_loss
         return action_counter + 1, optimal_flow, optimal_mode, total_demand_adjusted
 
     except Exception as e:
         logging.error(f"Sim step error: {e}")
+        prev_time = current_time
+        prev_actual_loss = actual_loss
         return action_counter + 1, prev_flow, prev_mode, prev_demand
 
 graph = build_dfan_graph(HOUSE_CONFIG)
-state_dim = 11  # Updated to 11 for delta_t and hp_power addition
+state_dim = 12  # Updated for chill_factor
 action_dim = 2
 model = ActorCritic(state_dim, action_dim)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -580,25 +640,10 @@ states = torch.zeros(state_dim)
 
 train_rl(graph, states, HOUSE_CONFIG, model, optimizer)
 
-# Initialize globals for refinements
-demand_history = deque(maxlen=3)
-low_delta_persist = 0
-low_power_start_time = None
-prev_hp_power = 0.0
-prev_flow_temp = 0.0
-prev_cop = 3.5  # New: Track previous COP
-cycle_type = None
-action_counter = 0
-prev_flow = 35.0
-prev_mode = 'off'
-prev_demand = 0.0
-prod_history = deque(maxlen=3)
-grid_history = deque(maxlen=3)
-
 def live_loop(graph, states, config, model, optimizer):
     global action_counter, prev_flow, prev_mode, prev_demand
     while True:
         action_counter, prev_flow, prev_mode, prev_demand = sim_step(graph, states, config, model, optimizer, action_counter, prev_flow, prev_mode, prev_demand)
-        time.sleep(120)  # 2min gather cycles
+        time.sleep(120)
 
 live_loop(graph, states, HOUSE_CONFIG, model, optimizer)
