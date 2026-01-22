@@ -374,7 +374,7 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         all_rates = current_day_rates + next_day_rates + current_day_export + next_day_export
         current_rate = get_current_rate(current_day_rates)
 
-        hot_water_active = fetch_ha_entity(config['entities']['water_heater']) == 'on'
+        hot_water_active = fetch_ha_entity(config['entities']['water_heater']) == 'high_demand'
         if hot_water_active:
             logging.info("Hot water active: Pausing space heating optimizations.")
             optimal_mode = 'off'
