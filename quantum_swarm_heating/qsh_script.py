@@ -305,11 +305,64 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         current_time = time.time()
         time_delta = current_time - prev_time
         dfan_control = fetch_ha_entity(config['entities']['dfan_control_toggle']) == 'on'
+        target_temp = float(fetch_ha_entity(config['entities']['pid_target_temperature']) or 21.0)
+        logging.info(f"Using target_temp: {target_temp}°C from pid_target_temperature.")
+        
+        # Fetch hot_water_active early to decide on pause
+        hot_water_active = fetch_ha_entity(config['entities']['water_heater']) == 'high_demand'
+        
+        if hot_water_active:
+            logging.info("Hot water active: Pausing all QSH processing (space heating optimizations, RL updates, cycle detection, and HA sets).")
+            optimal_mode = 'off'
+            optimal_flow = prev_flow  # Retain previous to avoid jumps on resume
+            total_demand_adjusted = 0.0
+            
+            # Compute room_targets (independent, for shadow logging only)
+            room_targets = {room: target_temp + ZONE_OFFSETS.get(room, 0.0) for room in config['rooms']}
+            for room in config['persistent_zones']:
+                room_targets[room] = 25.0
+            
+            # Minimal logging for mode decision (demand=0)
+            ext_temp = float(fetch_ha_entity(config['entities']['outdoor_temp']) or 0.0)  # Fetch minimally for log
+            current_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['current_day_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
+            current_rate = get_current_rate(current_day_rates)
+            logging.info(f"Mode decision: optimal_mode='off', total_demand=0.00 kW, ext_temp={ext_temp:.1f}°C, upcoming_cold=False, upcoming_high_wind=False, current_rate={current_rate:.3f} GBP/kWh, hot_water_active=True")
+            
+            # Reset cycle/low-power states to avoid false positives on resume
+            low_delta_persist = 0
+            low_power_start_time = None
+            cycle_type = None
+            cycle_start = None
+            pause_end = None
+            
+            # No RL update, no history appends, no cycle detection
+            
+            # Urgent check only for mode change (set mode 'off' if changed, but skip flow/temp sets to avoid interference)
+            urgent = (optimal_mode != prev_mode)
+            if dfan_control and (action_counter % 10 == 0 or urgent):
+                mode_data = {'device_id': config['hp_hvac_service']['device_id'], 'hvac_mode': optimal_mode}
+                set_ha_service(config['hp_hvac_service']['domain'], config['hp_hvac_service']['service'], mode_data)
+                logging.info(f"DFAN action triggered (minimal): { 'urgent' if urgent else 'scheduled' } - setting mode {optimal_mode} (flow unchanged).")
+            else:
+                logging.info(f"Data gather: Shadow would set mode {optimal_mode}. (Action in {10 - (action_counter % 10)} loops)")
+            
+            # Set minimal shadows: mode, demand=0, flow=prev (skip RL reward/loss, room setpoints to avoid unnecessary HA calls)
+            set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_shadow_mode', 'option': optimal_mode})
+            set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_optimal_mode', 'option': optimal_mode})
+            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_total_demand', 'value': 0.0})
+            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_shadow_flow', 'value': optimal_flow})
+            
+            # Log shadow rooms only (no HA set during pause)
+            for room in config['rooms']:
+                logging.info(f"Shadow: Would set {room} to {room_targets[room]:.1f}°C")
+            
+            prev_time = current_time
+            return action_counter + 1, optimal_flow, optimal_mode, total_demand_adjusted
+        
+        # Proceed with normal QSH processing if not hot_water_active
         ext_temp = float(fetch_ha_entity(config['entities']['outdoor_temp']) or 0.0)
         wind_speed = float(fetch_ha_entity(config['entities']['forecast_weather'], 'wind_speed') or 0.0)
         chill_factor = 1.0
-        target_temp = float(fetch_ha_entity(config['entities']['pid_target_temperature']) or 21.0)
-        logging.info(f"Using target_temp: {target_temp}°C from pid_target_temperature.")
         delta = target_temp - ext_temp
         if wind_speed > 5:
             effective_temp = 13.12 + 0.6215 * ext_temp - 11.37 * wind_speed**0.16 + 0.3965 * ext_temp * wind_speed**0.16
@@ -347,7 +400,6 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
                 logging.warning("Forecast entry missing 'datetime'—skipping.")
             except ValueError:
                 logging.warning(f"Invalid datetime in forecast: {f.get('datetime')}")
-
         forecast_min_temp = min(forecast_temps) if forecast_temps else ext_temp
         upcoming_cold = any(t < 5 for t in forecast_temps)
         upcoming_high_wind = any(w > 30 for w in forecast_winds)
@@ -374,11 +426,6 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         all_rates = current_day_rates + next_day_rates + current_day_export + next_day_export
         current_rate = get_current_rate(current_day_rates)
 
-        hot_water_active = fetch_ha_entity(config['entities']['water_heater']) == 'high_demand'
-        if hot_water_active:
-            logging.info("Hot water active: Pausing space heating optimizations.")
-            optimal_mode = 'off'
-        
         grid_power = float(fetch_ha_entity(config['entities']['grid_power']) or 0.0)
         grid_history.append(grid_power)
         smoothed_grid = sum(grid_history) / len(grid_history) if grid_history else 0.0
@@ -447,9 +494,6 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         if soc > 80 and export_kw > 1 and current_rate > 0.3:
             optimal_mode = 'off'
             logging.info("Export optimized pause: high SOC and export during peak rate")
-        
-        if hot_water_active:
-            optimal_mode = 'off'  # Moved after main decision to override if necessary
         
         current_flow_temp = float(fetch_ha_entity(config['entities']['hp_flow_temp']) or 35.0)
         cop_value = fetch_ha_entity(config['entities']['hp_cop'])
@@ -585,7 +629,7 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         export_bonus = (smoothed_grid / 1000.0) * config['fallback_rates']['export'] * 0.1 if smoothed_grid > 1000 else 0
 
         if volatile:
-            demand_penalty *= 1.5  # Increased penalty for volatility (corrected from previous 0.5)
+            demand_penalty *= 1.5
             flow_penalty *= 1.5
             ramp_penalty *= 1.5
             dt_penalty *= 1.5
