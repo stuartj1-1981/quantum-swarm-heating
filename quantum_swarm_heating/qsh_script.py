@@ -334,7 +334,7 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             room_targets[room] = 25.0
 
         actual_loss = total_loss(config, ext_temp, room_targets, chill_factor, loss_coeff, sum_af)
-        heat_up_power = sum(config['rooms'][room] * config['thermal_mass_per_m2'] * (room_targets[room] - fetch_ha_entity(config['entities'].get(config['zone_sensor_map'].get(room, 'independent_sensor01'))) or 0.0 for room in config['rooms']) / config['heat_up_tau_h']
+        heat_up_power = sum(config['rooms'][room] * config['thermal_mass_per_m2'] * (room_targets[room] - (fetch_ha_entity(config['entities'].get(config['zone_sensor_map'].get(room, 'independent_sensor01'))) or 0.0)) for room in config['rooms']) / config['heat_up_tau_h']
 
         production = float(fetch_ha_entity(config['entities']['solar_production']) or 0.0)
         prod_history.append(production)
