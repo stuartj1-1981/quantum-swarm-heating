@@ -123,7 +123,21 @@ HOUSE_CONFIG = {
         'pid_target_temperature': 'input_number.pid_target_temperature',
         'grid_power': 'sensor.givtcp_ce2029g082_grid_power',
         'primary_diff': 'sensor.primary_diff',
-        'hp_flow_temp': 'sensor.primary_flow_temperature'  
+        'hp_flow_temp': 'sensor.primary_flow_temperature',
+        # Added for Tado valve % open (adjust IDs based on your HA setup; these are examples from common Tado naming)
+        'lounge_heating': 'sensor.lounge_heating',
+        'open_plan_heating': 'sensor.living_area_heating',  # Note: For list, average or use primary
+        'utility_heating': 'sensor.utility_heating',
+        'cloaks_heating': 'sensor.wc_heating',
+        'bed1_heating': 'sensor.master_bedroom_heating',
+        'bed2_heating': 'sensor.fins_room_heating',
+        'bed3_heating': 'sensor.office_heatingg',
+        'bed4_heating': 'sensor.b1llz_room_heating',
+        'bathroom_heating': 'sensor.bathroom_heating',
+        'ensuite1_heating': 'sensor.ensuite1_heating',
+        'ensuite2_heating': 'sensor.ensuite2_heating',
+        'hall_heating': 'sensor.hall_heating',
+        'landing_heating': 'sensor.landing_heating',
     },
     'zone_sensor_map': { 'hall': 'independent_sensor01', 'bed1': 'independent_sensor02', 'landing': 'independent_sensor03', 'open_plan': 'independent_sensor04',
         'utility': 'independent_sensor01', 'cloaks': 'independent_sensor01', 'bed2': 'independent_sensor02', 'bed3': 'independent_sensor03', 'bed4': 'independent_sensor03',
@@ -286,6 +300,8 @@ def train_rl(model, optimizer, episodes=500):
 demand_history = deque(maxlen=5)  # Extended to 5
 prod_history = deque(maxlen=5)
 grid_history = deque(maxlen=5)
+cop_history = deque(maxlen=5)  # For median non-zero COP
+heat_up_history = deque(maxlen=5)  # (time, aggregate_heat_up) for rate
 low_delta_persist = 0
 low_power_start_time = None
 prev_hp_power = 1.0  # Better init: assume moderate power
@@ -307,7 +323,8 @@ undetected_count = 0
 enable_plots = user_options.get('enable_plots', False)
 first_loop = True  # New: Flag for startup
 epsilon = 0.2  # Initial exploration rate
-blend_factor = 0.5  # Initial RL blend factor
+blend_factor = 0.0  # Start at 0 for stability testing; ramp later
+last_heat_time = time.time() - 600  # Init as expired
 
 def shutdown_handler(sig, frame):
     mean_reward = sum(reward_history) / len(reward_history) if reward_history else 0
@@ -329,7 +346,7 @@ signal.signal(signal.SIGINT, shutdown_handler)
 signal.signal(signal.SIGTERM, shutdown_handler)
 
 def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow, prev_mode, prev_demand):
-    global low_delta_persist, low_power_start_time, prev_hp_power, prev_flow_temp, prev_cop, cycle_type, demand_history, prod_history, grid_history, prev_time, cycle_start, prev_actual_loss, pause_count, undetected_count, first_loop, pause_end, prev_all_rates, epsilon, blend_factor
+    global low_delta_persist, low_power_start_time, prev_hp_power, prev_flow_temp, prev_cop, cycle_type, demand_history, prod_history, grid_history, prev_time, cycle_start, prev_actual_loss, pause_count, undetected_count, first_loop, pause_end, prev_all_rates, epsilon, blend_factor, cop_history, heat_up_history, last_heat_time
     try:
         current_time = time.time()
         time_delta = current_time - prev_time
@@ -352,12 +369,12 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         
         if hot_water_active:
             logging.info("Hot water active: Pausing all QSH processing (space heating optimizations, RL updates, cycle detection, and HA sets).")
-            optimal_mode = 'heat'
+            optimal_mode = 'off'
             optimal_flow = prev_flow  # Retain previous to avoid jumps on resume
             total_demand_adjusted = 0.0
             
             # Minimal logging for mode decision (demand=0)
-            logging.info(f"Mode decision: total_demand=0.00 kW, ext_temp={ext_temp:.1f}°C, upcoming_cold=False, upcoming_high_wind=False, current_rate={current_rate:.3f} GBP/kWh, hot_water_active=True")
+            logging.info(f"Mode decision: optimal_mode='off', total_demand=0.00 kW, ext_temp={ext_temp:.1f}°C, upcoming_cold=False, upcoming_high_wind=False, current_rate={current_rate:.3f} GBP/kWh, hot_water_active=True")
             
             # Reset cycle/low-power states to avoid false positives on resume
             low_delta_persist = 0
@@ -439,12 +456,12 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         excess_solar = max(0, solar_production - hp_output) / 1000.0  # Assume W to kW
 
         # Rates
-        current_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['current_day_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
-        next_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['next_day_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
-        current_day_export = parse_rates_array(fetch_ha_entity(config['entities']['current_day_export_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
-        next_day_export = parse_rates_array(fetch_ha_entity(config['entities']['next_day_export_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
-        all_rates = current_day_rates + next_day_rates + current_day_export + next_day_export
-        current_rate = get_current_rate(current_day_rates)
+        suppress_warning = datetime.now(timezone.utc).hour < 16
+        next_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['next_day_rates'], 'rates') or [])
+        all_rates = current_day_rates + next_day_rates
+        if all_rates != prev_all_rates:
+            prev_all_rates = all_rates
+            logging.info("Rates updated.")
 
         # Loss calculation
         sum_af = sum(config['rooms'][room] * config['facings'][room] for room in config['rooms'])
@@ -456,9 +473,23 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         solar_gain = calc_solar_gain(config, solar_production / 1000.0)
 
         total_demand = max(0, actual_loss - solar_gain)
-        heat_up_power = sum(config['thermal_mass_per_m2'] * config['rooms'][room] * max(0, room_targets[room] - current_temps[room]) / (config['heat_up_tau_h'] * 3600) for room in config['rooms'])
-        total_demand_adjusted = total_demand + heat_up_power
+        aggregate_heat_up = sum(config['thermal_mass_per_m2'] * config['rooms'][room] * max(0, room_targets[room] - current_temps[room]) for room in config['rooms']) / (config['heat_up_tau_h'] * 3600)
+        total_demand_adjusted = total_demand + aggregate_heat_up
 
+        # Valve feedback (Point 1 & 2)
+        heating_percs = {}
+        for room in config['rooms']:
+            heating_entity = f'{room}_heating'
+            if heating_entity in config['entities']:
+                heating_percs[room] = float(fetch_ha_entity(config['entities'][heating_entity]) or 0)
+            else:
+                heating_percs[room] = 0  # Fallback if not found
+        avg_open_frac = np.mean(list(heating_percs.values())) / 100 if heating_percs else 1.0
+
+        total_demand_adjusted *= max(0.5, avg_open_frac)
+        if avg_open_frac < 0.7:
+            logging.warning(f"Low valve open frac ({avg_open_frac:.2f})—scaling demand and reducing flow.")
+        
         # Append to history and smooth
         demand_history.append(total_demand_adjusted)
         smoothed_demand = np.mean(demand_history)
@@ -468,6 +499,13 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         grid_history.append(grid_power)
         smoothed_grid = np.mean(grid_history) if grid_history else 0.0
         export_kw = max(0, -smoothed_grid / 1000.0)  # Assuming negative grid is export
+
+        heat_up_history.append((current_time, aggregate_heat_up))
+        if len(heat_up_history) > 1:
+            dt = current_time - heat_up_history[0][0]
+            heat_up_rate = (aggregate_heat_up - heat_up_history[0][1]) / (dt / 60) if dt > 0 else 0
+        else:
+            heat_up_rate = 0
 
         delta_t = float(fetch_ha_entity(config['entities']['primary_diff']) or 3.0)
         hp_power = float(fetch_ha_entity(config['entities']['hp_energy_rate']) or 0.0)
@@ -481,60 +519,48 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         flow_min = float(fetch_ha_entity(config['entities']['flow_min_temp']) or 32.0)
         flow_max = float(fetch_ha_entity(config['entities']['flow_max_temp']) or 50.0)
 
-        # Compute deterministic flow and mode
-        det_flow = max(flow_min, min(flow_max, 35 + (smoothed_demand / config['peak_loss'] * (flow_max - 35))))
-        wc_cap = min(50, max(30, 50 - (ext_temp * 1.2)))
-        det_flow = min(det_flow, wc_cap)
+        # Det flow (Point 4: Start low, increase on need)
+        det_flow = 30 + (smoothed_demand / config['peak_loss'] * 10)  # Low scale, no WC
+        if heat_up_rate < 0.1 and avg_open_frac > 0.5:  # Slow rise with open valves? Increment
+            det_flow += 2
+            logging.info(f"Slow heat_up rate ({heat_up_rate:.2f}°C/min)—incrementing flow +2°C.")
         if upcoming_cold and current_rate < 0.15:
-            det_flow += 5
-            logging.info("Proactive heating would boost det_flow by 5°C due to forecast cold snap.")
+            det_flow += 3  # Reduced proactive
         if upcoming_high_wind and current_rate < 0.15:
-            det_flow += 3
-            logging.info("Proactive heating would boost det_flow by 3°C due to forecast high wind.")
+            det_flow += 2  # Reduced
         det_flow = max(flow_min, min(flow_max, det_flow))
 
-        det_mode = 'heat' if smoothed_demand > 1.5 or ext_temp < 5 or (upcoming_cold and current_rate < 0.15) or (upcoming_high_wind and current_rate < 0.15) else 'off'
-        if excess_solar > 1 and det_mode == 'off':
-            logging.info("Would have used 'auto' in old logic—defaulting to 'off' for QSH control.")
+        # Det mode (Point 3: No 'off' if demand)
+        det_mode = 'heat' if smoothed_demand > 0 or aggregate_heat_up > 0.2 else 'off'
 
-        # RL influence
+        # RL influence (limit to flow only; no mode)
         states = torch.tensor([current_rate, soc, prev_cop, prev_flow, smoothed_demand, excess_solar, wind_speed, forecast_min_temp, smoothed_grid, delta_t, hp_power, chill_factor, demand_std], dtype=torch.float32)
         action, value = model(states.unsqueeze(0))
         action = action.squeeze(0)
 
-        mode_prob = F.sigmoid(action[0])
-        if random.random() < epsilon:
-            optimal_mode = 'heat' if random.random() > 0.5 else 'off'  # Explore
-        else:
-            optimal_mode = 'heat' if mode_prob > 0.5 else 'off'  # Greedy
-
         actor_flow = 30 + (F.sigmoid(action[1]) * 20)
         optimal_flow = (blend_factor * actor_flow.item()) + ((1 - blend_factor) * det_flow)
 
-        # Apply proactive if mode heat
+        # Flow react to valves (Point 2)
+        if avg_open_frac < 0.7:
+            optimal_flow -= 5 * (0.7 - avg_open_frac)
+            logging.info(f"Reducing flow -{5 * (0.7 - avg_open_frac):.1f}°C for low open frac.")
+
+        # Limit change
+        optimal_flow = max(prev_flow - 3, min(prev_flow + 3, optimal_flow))
+
+        # Min run safeguard (Point 3)
+        optimal_mode = det_mode
         if optimal_mode == 'heat':
-            if upcoming_cold and current_rate < 0.15:
-                optimal_flow += 5
-            if upcoming_high_wind and current_rate < 0.15:
-                optimal_flow += 3
+            last_heat_time = current_time
+        elif optimal_mode == 'off' and (current_time - last_heat_time) < 600:  # 10min
+            optimal_mode = 'heat'
+            logging.info("Min run safeguard: Extending 'heat' to dissipate residual.")
 
-        # Safeguards
-        optimal_flow = min(optimal_flow, wc_cap)
-        if low_delta_persist >= 2:
-            optimal_flow += 2.0
-        optimal_flow = max(flow_min, min(flow_max, optimal_flow))
-
-        # Export safety override
-        if soc > 80 and export_kw > 1 and current_rate > 0.3:
+        # Export optimized pause (keep but only if no heat_up)
+        if soc > 80 and export_kw > 1 and current_rate > 0.3 and aggregate_heat_up <= 0.2:
             optimal_mode = 'off'
             logging.info("Export optimized pause: high SOC and export during peak rate—overriding to 'off'")
-
-        # Log overrides
-        if optimal_mode != det_mode:
-            logging.info(f"RL override: Changed mode from det '{det_mode}' to '{optimal_mode}' (prob: {mode_prob.item():.2f})")
-        flow_diff = abs(optimal_flow - det_flow)
-        if flow_diff > 2.0:
-            logging.info(f"RL adjusted flow by {flow_diff:.1f}°C from det {det_flow:.1f}°C to {optimal_flow:.1f}°C")
 
         optimal_flow = round(optimal_flow, 1)
         flow_min = round(flow_min, 1)
@@ -548,12 +574,13 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         cop_value = fetch_ha_entity(config['entities']['hp_cop'])
         if cop_value == 'unavailable':
             cop_value = fetch_ha_entity(config['entities']['hp_cop'])  # Redundancy
-        if cop_value == 'unavailable':
-            logging.warning("COP gap - potential undetected cycle")
-            undetected_count += 1
-            live_cop = prev_cop
+        if cop_value == 'unavailable' or float(cop_value or 0) <= 0:
+            logging.warning("COP gap or <=0 - using median history.")
+            non_zero_cops = [c for c in cop_history if c > 0]
+            live_cop = np.median(non_zero_cops) if non_zero_cops else 3.0
         else:
-            live_cop = float(cop_value) if cop_value else prev_cop
+            live_cop = float(cop_value)
+        cop_history.append(live_cop)
 
         power_delta = hp_power - prev_hp_power
         flow_delta_actual = current_flow_temp - prev_flow_temp  # Actual flow delta
@@ -626,10 +653,6 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         if not first_loop and abs(demand_delta) >= DEMAND_DELTA_THRESHOLD and not cycle_type:
             logging.warning(f"Potential undetected cycle: large Δdemand {demand_delta:.2f} kW without patterns")
             undetected_count += 1
-        
-        if live_cop <= 0:
-            logging.warning("Live COP <=0 outside cycle; using previous COP.")
-            live_cop = prev_cop
 
         # Always update prev after detection/check
         prev_hp_power = hp_power
@@ -667,7 +690,7 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
 
         # Base reward with scaling
         reward = -0.8 * current_rate * total_demand_adjusted / live_cop
-        reward += (live_cop - 3.0) * 0.5 - (abs(heat_up_power) * 0.1)
+        reward += (live_cop - 3.0) * 0.5 - (abs(aggregate_heat_up) * 0.1)  # Use aggregate
         reward += reward_adjust
 
         volatile = abs(demand_delta) > 1.0
@@ -703,15 +726,25 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         reward -= volatility_penalty
         logging.info(f"DFAN RL: demand_std={demand_std:.2f} kW, volatility_penalty={volatility_penalty:.2f}")
 
-        # A2C loss
+        # Additional penalties (Point 4: High flow in mild)
+        if ext_temp > 5 and optimal_flow > 40:
+            reward -= 1.5  # Penalize
+        # Valve penalty
+        if avg_open_frac < 0.5:
+            reward -= 2  # Bad control if many closed
+
+        # A2C loss (skip if COP original <=0)
+        original_cop = float(fetch_ha_entity(config['entities']['hp_cop']) or 0)
+        if original_cop <= 0:
+            logging.info("Skipping reward update due to COP <=0.")
+            reward = 0.0
         td_error = reward - value.item()
         critic_loss = td_error ** 2
 
-        optimal_mode_num = 1.0 if optimal_mode == 'heat' else 0.0
-        mode_log_prob = F.binary_cross_entropy_with_logits(action[0], torch.tensor(optimal_mode_num))
+        # Actor loss (flow only, since no mode RL)
         norm_flow = (optimal_flow - 30) / 20
         flow_mse = (action[1] - torch.tensor(norm_flow)).pow(2)
-        actor_loss = mode_log_prob + flow_mse
+        actor_loss = flow_mse  # No mode
 
         loss = critic_loss + (0.5 * actor_loss)
 
