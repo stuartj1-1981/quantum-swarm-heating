@@ -311,21 +311,23 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         # Fetch hot_water_active early to decide on pause
         hot_water_active = fetch_ha_entity(config['entities']['water_heater']) == 'high_demand'
         
+        # Compute room_targets (independent, for shadow logging only)
+        room_targets = {room: target_temp + ZONE_OFFSETS.get(room, 0.0) for room in config['rooms']}
+        for room in config['persistent_zones']:
+            room_targets[room] = 25.0
+        
+        # Minimal fetching for log
+        ext_temp = float(fetch_ha_entity(config['entities']['outdoor_temp']) or 0.0)
+        current_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['current_day_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
+        current_rate = get_current_rate(current_day_rates)
+        
         if hot_water_active:
             logging.info("Hot water active: Pausing all QSH processing (space heating optimizations, RL updates, cycle detection, and HA sets).")
             optimal_mode = 'off'
             optimal_flow = prev_flow  # Retain previous to avoid jumps on resume
             total_demand_adjusted = 0.0
             
-            # Compute room_targets (independent, for shadow logging only)
-            room_targets = {room: target_temp + ZONE_OFFSETS.get(room, 0.0) for room in config['rooms']}
-            for room in config['persistent_zones']:
-                room_targets[room] = 25.0
-            
             # Minimal logging for mode decision (demand=0)
-            ext_temp = float(fetch_ha_entity(config['entities']['outdoor_temp']) or 0.0)  # Fetch minimally for log
-            current_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['current_day_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
-            current_rate = get_current_rate(current_day_rates)
             logging.info(f"Mode decision: optimal_mode='off', total_demand=0.00 kW, ext_temp={ext_temp:.1f}°C, upcoming_cold=False, upcoming_high_wind=False, current_rate={current_rate:.3f} GBP/kWh, hot_water_active=True")
             
             # Reset cycle/low-power states to avoid false positives on resume
@@ -353,78 +355,90 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             sum_af = 0.0
             flow_min = float(fetch_ha_entity(config['entities']['flow_min_temp']) or 32.0)
             flow_max = float(fetch_ha_entity(config['entities']['flow_max_temp']) or 50.0)
-            optimal_flow = prev_flow  # Do not recalculate
             current_flow_temp = float(fetch_ha_entity(config['entities']['hp_flow_temp']) or 35.0)
             reward = 0.0  # Default, since no RL update
             loss = torch.tensor(0.0)  # Default
-        else:
-            # Compute room_targets
-            room_targets = {room: target_temp + ZONE_OFFSETS.get(room, 0.0) for room in config['rooms']}
-            for room in config['persistent_zones']:
-                room_targets[room] = 25.0
+            heat_up_power = 0.0
+            export_kw = 0.0
+            
+            # Skip to shadow sets and return
+            clamped_demand = max(min(total_demand_adjusted, 15.0), 0.0)
+            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_total_demand', 'value': clamped_demand})
+            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_shadow_flow', 'value': optimal_flow})
+            set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_shadow_mode', 'option': optimal_mode})
+            set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_optimal_mode', 'option': optimal_mode})
+            clamped_reward = max(min(reward, 100.0), -100.0)
+            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_rl_reward', 'value': clamped_reward})
+            clamped_loss = max(min(loss.item(), 2000.0), 0.0)
+            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_rl_loss', 'value': clamped_loss})
 
-            # Fetch sensor temps
-            sensor_temps = {
-                'independent_sensor01': float(fetch_ha_entity(config['entities']['independent_sensor01']) or target_temp),
-                'independent_sensor02': float(fetch_ha_entity(config['entities']['independent_sensor02']) or target_temp),
-                'independent_sensor03': float(fetch_ha_entity(config['entities']['independent_sensor03']) or target_temp),
-                'independent_sensor04': float(fetch_ha_entity(config['entities']['independent_sensor04']) or target_temp),
-            }
-            current_temps = {room: sensor_temps[config['zone_sensor_map'][room]] for room in config['rooms']}
+            for room in config['rooms']:
+                shadow_setpoint = room_targets[room]
+                entity_id = f'input_number.qsh_shadow_{room}_setpoint'
+                set_ha_service('input_number', 'set_value', {'entity_id': entity_id, 'value': shadow_setpoint})
+                if not dfan_control:
+                    logging.info(f"Shadow: Would set {room} to {shadow_setpoint:.1f}°C")
 
-            # Fetch ext_temp
-            ext_temp = float(fetch_ha_entity(config['entities']['outdoor_temp']) or 0.0)
+            prev_time = current_time
+            return action_counter + 1, optimal_flow, optimal_mode, total_demand_adjusted
+        
+        # Else: Normal processing
+        # Fetch sensor temps
+        sensor_temps = {
+            'independent_sensor01': float(fetch_ha_entity(config['entities']['independent_sensor01']) or target_temp),
+            'independent_sensor02': float(fetch_ha_entity(config['entities']['independent_sensor02']) or target_temp),
+            'independent_sensor03': float(fetch_ha_entity(config['entities']['independent_sensor03']) or target_temp),
+            'independent_sensor04': float(fetch_ha_entity(config['entities']['independent_sensor04']) or target_temp),
+        }
+        current_temps = {room: sensor_temps[config['zone_sensor_map'][room]] for room in config['rooms']}
 
-            # Fetch forecast
-            forecast = fetch_ha_entity(config['entities']['forecast_weather'], 'forecast') or []
-            forecast_temps = [f['temperature'] for f in forecast if 'temperature' in f]
-            forecast_wind_speeds = [f['wind_speed'] for f in forecast if 'wind_speed' in f]
-            forecast_min_temp = min(forecast_temps or [ext_temp])
-            wind_speed = float(fetch_ha_entity(config['entities']['forecast_weather'], 'wind_speed') or 0.0)
-            upcoming_cold = any(t < 0 for t in forecast_temps)
-            upcoming_high_wind = any(w > 15 for w in forecast_wind_speeds)
-            chill_factor = 1.0 + (wind_speed / 10.0) * 0.1
+        # Fetch forecast
+        forecast = fetch_ha_entity(config['entities']['forecast_weather'], 'forecast') or []
+        forecast_temps = [f['temperature'] for f in forecast if 'temperature' in f]
+        forecast_wind_speeds = [f['wind_speed'] for f in forecast if 'wind_speed' in f]
+        forecast_min_temp = min(forecast_temps or [ext_temp])
+        wind_speed = float(fetch_ha_entity(config['entities']['forecast_weather'], 'wind_speed') or 0.0)
+        upcoming_cold = any(t < 0 for t in forecast_temps)
+        upcoming_high_wind = any(w > 15 for w in forecast_wind_speeds)
+        chill_factor = 1.0 + (wind_speed / 10.0) * 0.1
 
-            # Fetch solar, grid, soc, hp_output
-            solar_production = float(fetch_ha_entity(config['entities']['solar_production']) or 0.0)
-            grid_power = float(fetch_ha_entity(config['entities']['grid_power']) or 0.0)
-            soc = float(fetch_ha_entity(config['entities']['battery_soc']) or 50.0)
-            hp_output = float(fetch_ha_entity(config['entities']['hp_output']) or 0.0)
-            excess_solar = max(0, solar_production - hp_output) / 1000.0  # Assume W to kW
+        # Fetch solar, grid, soc, hp_output
+        solar_production = float(fetch_ha_entity(config['entities']['solar_production']) or 0.0)
+        grid_power = float(fetch_ha_entity(config['entities']['grid_power']) or 0.0)
+        soc = float(fetch_ha_entity(config['entities']['battery_soc']) or 50.0)
+        hp_output = float(fetch_ha_entity(config['entities']['hp_output']) or 0.0)
+        excess_solar = max(0, solar_production - hp_output) / 1000.0  # Assume W to kW
 
-            # Rates
-            suppress_warning = datetime.now(timezone.utc).hour < 16
-            current_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['current_day_rates'], 'rates') or [], suppress_warning=suppress_warning)
-            next_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['next_day_rates'], 'rates') or [])
-            all_rates = current_day_rates + next_day_rates
-            if all_rates != prev_all_rates:
-                prev_all_rates = all_rates
-                logging.info("Rates updated.")
-            current_rate = get_current_rate(current_day_rates)
+        # Rates
+        suppress_warning = datetime.now(timezone.utc).hour < 16
+        next_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['next_day_rates'], 'rates') or [])
+        all_rates = current_day_rates + next_day_rates
+        if all_rates != prev_all_rates:
+            prev_all_rates = all_rates
+            logging.info("Rates updated.")
 
-            # Loss calculation
-            sum_af = sum(config['rooms'][room] * config['facings'][room] for room in config['rooms'])
-            design_targets = {room: config['design_target'] for room in config['rooms']}
-            base_loss = total_loss(config, config['peak_ext'], design_targets, 1.0, 1.0, sum_af)  # Fixed: use 1.0 for base
-            loss_coeff = config['peak_loss'] / base_loss if base_loss > 0 else 0.0
-            actual_loss = total_loss(config, ext_temp, room_targets, chill_factor, loss_coeff, sum_af)
+        # Loss calculation
+        sum_af = sum(config['rooms'][room] * config['facings'][room] for room in config['rooms'])
+        design_targets = {room: config['design_target'] for room in config['rooms']}
+        base_loss = total_loss(config, config['peak_ext'], design_targets, 1.0, 1.0, sum_af)  # Fixed: use 1.0 for base
+        loss_coeff = config['peak_loss'] / base_loss if base_loss > 0 else 0.0
+        actual_loss = total_loss(config, ext_temp, room_targets, chill_factor, loss_coeff, sum_af)
 
-            solar_gain = calc_solar_gain(config, solar_production / 1000.0)
+        solar_gain = calc_solar_gain(config, solar_production / 1000.0)
 
-            total_demand = max(0, actual_loss - solar_gain)
-            heat_up_power = sum(config['thermal_mass_per_m2'] * config['rooms'][room] * max(0, room_targets[room] - current_temps[room]) / (config['heat_up_tau_h'] * 3600) for room in config['rooms'])
-            total_demand_adjusted = total_demand + heat_up_power
+        total_demand = max(0, actual_loss - solar_gain)
+        heat_up_power = sum(config['thermal_mass_per_m2'] * config['rooms'][room] * max(0, room_targets[room] - current_temps[room]) / (config['heat_up_tau_h'] * 3600) for room in config['rooms'])
+        total_demand_adjusted = total_demand + heat_up_power
 
-            # Append to history and smooth
-            demand_history.append(total_demand_adjusted)
-            smoothed_demand = np.mean(demand_history)
-            demand_std = np.std(demand_history) if len(demand_history) > 1 else 0.0
+        # Append to history and smooth
+        demand_history.append(total_demand_adjusted)
+        smoothed_demand = np.mean(demand_history)
+        demand_std = np.std(demand_history) if len(demand_history) > 1 else 0.0
 
-            prod_history.append(solar_production)
-            grid_history.append(grid_power)
-            smoothed_grid = np.mean(grid_history) if grid_history else 0.0
-
-        demand_std = 0.0
+        prod_history.append(solar_production)
+        grid_history.append(grid_power)
+        smoothed_grid = np.mean(grid_history) if grid_history else 0.0
+        export_kw = max(0, -smoothed_grid / 1000.0)  # Assuming negative grid is export
 
         delta_t = float(fetch_ha_entity(config['entities']['primary_diff']) or 3.0)
         hp_power = float(fetch_ha_entity(config['entities']['hp_energy_rate']) or 0.0)
@@ -512,4 +526,219 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             first_loop = False
         else:
             detected = False
-            if flow_delta_actual <= FLOW_TEMP_DROP_THRESHOLD or cop_delta <= COP_DROP_THRESHOLD or demand_delta <=
+            if (flow_delta_actual <= FLOW_TEMP_DROP_THRESHOLD or
+                cop_delta <= COP_DROP_THRESHOLD or
+                demand_delta <= -DEMAND_DELTA_THRESHOLD or
+                loss_delta <= -LOSS_DELTA_THRESHOLD):
+                detected = True
+                cycle_type = 'defrost'
+            elif (power_delta >= POWER_SPIKE_THRESHOLD or
+                  flow_delta_actual >= FLOW_TEMP_SPIKE_THRESHOLD or
+                  cop_delta >= COP_SPIKE_THRESHOLD or
+                  demand_delta >= DEMAND_DELTA_THRESHOLD or
+                  loss_delta >= LOSS_DELTA_THRESHOLD):
+                detected = True
+                cycle_type = 'oil_recovery'
+
+            if detected:
+                if cycle_start is None:
+                    cycle_start = current_time
+                logging.info(f"{cycle_type.capitalize()} cycle detected: Power delta {power_delta:.2f}kW / Flow delta {flow_delta_actual:.2f}°C / COP delta {cop_delta:.2f} / Demand delta {demand_delta:.2f} / Loss delta {loss_delta:.2f}")
+                pause_end = current_time + EXTENDED_RECOVERY_TIME  # Set fixed pause on detection
+
+        if hp_power < MIN_MODULATION_POWER and smoothed_demand > 0:
+            if low_power_start_time is None:
+                low_power_start_time = current_time
+                logging.info("Low HP power detected: Monitoring for cycle patterns...")
+            time_in_low = current_time - low_power_start_time
+            if time_in_low > LOW_POWER_MIN_IGNORE and cycle_type:
+                time_in_cycle = current_time - cycle_start if cycle_start else 0
+                if time_in_cycle > EXTENDED_RECOVERY_TIME:
+                    logging.info(f"Extended recovery pause: Type {cycle_type}, duration {time_in_cycle:.0f}s")
+            if time_in_low > LOW_POWER_MAX_TOLERANCE:
+                optimal_flow += 2.0
+                optimal_flow = min(optimal_flow, flow_max)
+                low_power_start_time = None
+                logging.warning("Persistent low HP power without cycle patterns: Boosting demand")
+        else:
+            if low_power_start_time:
+                time_in_low = current_time - low_power_start_time
+                logging.info(f"HP power recovered: Ending monitor (cycle: {cycle_type or 'none'}, duration {time_in_low:.0f}s)")
+            low_power_start_time = None
+        
+        if not first_loop and abs(demand_delta) >= DEMAND_DELTA_THRESHOLD and not cycle_type:
+            logging.warning(f"Potential undetected cycle: large Δdemand {demand_delta:.2f} kW without patterns")
+            undetected_count += 1
+        
+        if live_cop <= 0:
+            logging.warning("Live COP <=0 outside cycle; using fallback COP.")
+            live_cop = 3.0  # Fallback to average COP
+
+        # Always update prev after detection/check
+        prev_hp_power = hp_power
+        prev_flow_temp = current_flow_temp
+        prev_cop = live_cop
+        prev_actual_loss = actual_loss
+        prev_demand = total_demand_adjusted
+
+        logging.info(f"Mode decision: optimal_mode='{optimal_mode}', total_demand={smoothed_demand:.2f} kW, "
+                     f"ext_temp={ext_temp:.1f}°C, upcoming_cold={upcoming_cold}, upcoming_high_wind={upcoming_high_wind}, current_rate={current_rate:.3f} GBP/kWh, "
+                     f"hot_water_active={hot_water_active}")
+
+        states = torch.tensor([current_rate, soc, live_cop, optimal_flow, smoothed_demand, excess_solar, wind_speed, forecast_min_temp, smoothed_grid, delta_t, hp_power, chill_factor, demand_std], dtype=torch.float32)
+
+        action = model.actor(states.unsqueeze(0))
+
+        # Reward adjustments from previous loss
+        reward_adjust = 0
+        if loss_history:
+            prev_loss = loss_history[-1]
+            if prev_loss > 100:
+                reward_adjust -= 0.4
+        if len(loss_history) >= 5 and sum(list(loss_history)[-5:]) / 5 < 1:
+            reward_adjust += 0.4
+
+        # Cycle-aware rewards: Trigger only on cycle completion
+        if pause_end and current_time >= pause_end:
+            if len(demand_history) >= 5:
+                recent_demand_std = np.std(list(demand_history)[-5:])  # Last 5 for post-pause stability
+                if recent_demand_std < 0.5:  # Stable recovery (tunable threshold)
+                    reward_adjust += 0.4  # Bonus for smooth rebound
+                    logging.info(f"Cycle-aware bonus: +0.4 for low demand_std {recent_demand_std:.2f} kW post-recovery (type: {cycle_type})")
+                elif recent_demand_std > 1.0:  # Volatile recovery
+                    reward_adjust -= 0.3  # Mild penalty
+                    logging.info(f"Cycle-aware penalty: -0.3 for high demand_std {recent_demand_std:.2f} kW post-recovery (type: {cycle_type})")
+            pause_end = None
+            cycle_type = None
+            cycle_start = None
+
+        # Base reward with scaling
+        reward = -0.8 * current_rate * total_demand_adjusted / live_cop
+        reward += (live_cop - 3.0) * 0.5 - (abs(heat_up_power) * 0.1)
+        reward += reward_adjust
+
+        volatile = abs(demand_delta) > 1.0
+
+        # Penalties and bonuses
+        demand_penalty = 0.5 if abs(demand_delta) > 1.0 else 0
+        flow_penalty = 0.3 if abs(flow_delta) > 2.0 else 0
+        ramp_penalty = 0.3 if flow_ramp_rate > 1.5 else 0
+        dt_penalty = max(0, 3.0 - delta_t) * 2.0
+        grid_penalty = abs(smoothed_grid / 1000.0) * current_rate * 0.2 if current_rate > 0.3 and smoothed_grid < -500 else 0
+        export_bonus = (smoothed_grid / 1000.0) * config['fallback_rates']['export'] * 0.1 if smoothed_grid > 1000 else 0
+
+        if volatile:
+            demand_penalty *= 1.5
+            flow_penalty *= 1.5
+            ramp_penalty *= 1.5
+            dt_penalty *= 1.5
+            grid_penalty *= 1.5
+
+        reward -= (demand_penalty + flow_penalty + ramp_penalty + dt_penalty + grid_penalty)
+        reward += export_bonus
+
+        # Stability bonuses
+        if abs(demand_delta) < 0.5:
+            reward += 0.3
+        if abs(flow_delta) < 0.5:
+            reward += 0.2
+
+        # DFAN RL Enhancement: Volatility penalty based on demand_std
+        volatility_penalty = 0.0
+        if demand_std > 0.5:
+            volatility_penalty = 0.2 * (demand_std - 0.5)
+        reward -= volatility_penalty
+        logging.info(f"DFAN RL: demand_std={demand_std:.2f} kW, volatility_penalty={volatility_penalty:.2f}")
+
+        value = model.critic(states.unsqueeze(0))
+        loss = (reward - value).pow(2).mean()
+
+        # Loss scaling for anomalies
+        if smoothed_demand > 50:
+            loss = loss * 0.5
+
+        optimizer.zero_grad()
+        loss.backward()
+
+        # Gradient clipping
+        for p in model.parameters():
+            if p.grad is not None:
+                p.grad.data.clamp_(-10, 10)
+
+        optimizer.step()
+        logging.info(f"RL update: Reward {reward:.2f}, Loss {loss.item():.4f}")
+
+        reward_history.append(reward)
+        loss_history.append(loss.item())
+
+        flow_delta = abs(optimal_flow - prev_flow)
+        demand_delta = abs(smoothed_demand - prev_demand)
+        urgent = (optimal_mode != prev_mode) or (flow_delta > 2.0) or (demand_delta > 0.5) or (low_delta_persist >= 2) or (hp_power < 0.20)
+        if dfan_control and (action_counter % 10 == 0 or urgent):
+            for room in config['rooms']:
+                entity_key = room + '_temp_set_hum'
+                if entity_key in config['entities']:
+                    temperature = room_targets[room]
+                    data = {'entity_id': config['entities'][entity_key], 'temperature': temperature}
+                    set_ha_service('climate', 'set_temperature', data)
+
+            flow_data = {'device_id': config['hp_flow_service']['device_id'],
+                         **config['hp_flow_service']['base_data'],
+                         'weather_comp_min_temperature': flow_min,
+                         'weather_comp_max_temperature': flow_max,
+                         'fixed_flow_temperature': optimal_flow}
+            set_ha_service(config['hp_flow_service']['domain'], config['hp_flow_service']['service'], flow_data)
+
+            mode_data = {'device_id': config['hp_hvac_service']['device_id'], 'hvac_mode': optimal_mode}
+            set_ha_service(config['hp_hvac_service']['domain'], config['hp_hvac_service']['service'], mode_data)
+            
+            if optimal_mode == 'heat':
+                temp_data = {'device_id': config['hp_hvac_service']['device_id'], 'temperature': 23.0}
+                set_ha_service('climate', 'set_temperature', temp_data)
+                logging.info("DFAN setpoint adjust: Set HP temperature to static 23°C in 'heat' mode to override internal control.")
+
+            logging.info(f"DFAN action triggered: { 'urgent' if urgent else 'scheduled' } - setting flow {optimal_flow:.1f}°C, mode {optimal_mode}.")
+        else:
+            logging.info(f"Data gather: Shadow would set flow {optimal_flow:.1f}°C and mode {optimal_mode}. (Action in {10 - (action_counter % 10)} loops)")
+
+        clamped_demand = max(min(total_demand_adjusted, 15.0), 0.0)
+        set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_total_demand', 'value': clamped_demand})
+        set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_shadow_flow', 'value': optimal_flow})
+        set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_shadow_mode', 'option': optimal_mode})
+        set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_optimal_mode', 'option': optimal_mode})
+        clamped_reward = max(min(reward, 100.0), -100.0)
+        set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_rl_reward', 'value': clamped_reward})
+        clamped_loss = max(min(loss.item(), 2000.0), 0.0)
+        set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_rl_loss', 'value': clamped_loss})
+
+        for room in config['rooms']:
+            shadow_setpoint = room_targets[room]
+            entity_id = f'input_number.qsh_shadow_{room}_setpoint'
+            set_ha_service('input_number', 'set_value', {'entity_id': entity_id, 'value': shadow_setpoint})
+            if not dfan_control:
+                logging.info(f"Shadow: Would set {room} to {shadow_setpoint:.1f}°C")
+
+        prev_time = current_time
+        return action_counter + 1, optimal_flow, optimal_mode, total_demand_adjusted
+
+    except Exception as e:
+        logging.error(f"Sim step error: {e}")
+        prev_time = current_time
+        return action_counter + 1, prev_flow, prev_mode, prev_demand
+
+graph = build_dfan_graph(HOUSE_CONFIG)
+state_dim = 13  # Updated for chill_factor + demand_std
+action_dim = 2
+model = ActorCritic(state_dim, action_dim)
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+states = torch.zeros(state_dim)
+
+train_rl(graph, states, HOUSE_CONFIG, model, optimizer)
+
+def live_loop(graph, states, config, model, optimizer):
+    global action_counter, prev_flow, prev_mode, prev_demand
+    while True:
+        action_counter, prev_flow, prev_mode, prev_demand = sim_step(graph, states, config, model, optimizer, action_counter, prev_flow, prev_mode, prev_demand)
+        time.sleep(120)
+
+live_loop(graph, states, HOUSE_CONFIG, model, optimizer)
