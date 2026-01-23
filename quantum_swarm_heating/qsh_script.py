@@ -2,6 +2,7 @@ from logging import config
 import networkx as nx
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import random
 from datetime import datetime, timedelta, timezone
@@ -244,16 +245,42 @@ class ActorCritic(nn.Module):
         self.actor = SimpleQNet(state_dim, action_dim)
         self.critic = SimpleQNet(state_dim, 1)
 
-def train_rl(graph, states, config, model, optimizer, episodes=500):
+    def forward(self, x):
+        action = self.actor(x)
+        value = self.critic(x)
+        return action, value
+
+def train_rl(model, optimizer, episodes=500):
     for _ in range(episodes):
-        action = model.actor(states)
-        reward = random.uniform(-1, 1)
-        value = model.critic(states)
-        loss = (reward - value).pow(2).mean()
+        # Simulate hypothetical state (random for variety)
+        sim_state = torch.rand(13) * 10
+        action, value = model(sim_state.unsqueeze(0))
+        action = action.squeeze(0)
+        
+        # Simulate det logic approx (e.g., high demand → heat, high flow)
+        sim_demand = sim_state[4].item()  # Index 4: smoothed_demand
+        sim_mode = 1.0 if sim_demand > 5 else 0.0
+        sim_flow = 45.0 if sim_demand > 5 else 35.0
+        norm_flow = (sim_flow - 30) / 20
+        
+        # Simulate reward (good if matches sim)
+        mode_match = (F.sigmoid(action[0]) > 0.5) == (sim_mode == 1.0)
+        flow_err = abs(action[1].item() - norm_flow)
+        sim_reward = 1.0 if mode_match and flow_err < 0.1 else -1.0
+        
+        td_error = sim_reward - value.item()
+        critic_loss = td_error ** 2
+        
+        mode_log_prob = F.binary_cross_entropy_with_logits(action[0], torch.tensor(sim_mode))
+        flow_mse = (action[1] - torch.tensor(norm_flow)).pow(2)
+        actor_loss = mode_log_prob + flow_mse
+        
+        loss = critic_loss + 0.5 * actor_loss
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-    logging.info("Initial RL training complete.")
+    logging.info("Initial RL training complete with simulated scenarios.")
 
 # Globals for refinements
 demand_history = deque(maxlen=5)  # Extended to 5
@@ -279,6 +306,8 @@ pause_count = 0
 undetected_count = 0
 enable_plots = user_options.get('enable_plots', False)
 first_loop = True  # New: Flag for startup
+epsilon = 0.2  # Initial exploration rate
+blend_factor = 0.5  # Initial RL blend factor
 
 def shutdown_handler(sig, frame):
     mean_reward = sum(reward_history) / len(reward_history) if reward_history else 0
@@ -300,7 +329,7 @@ signal.signal(signal.SIGINT, shutdown_handler)
 signal.signal(signal.SIGTERM, shutdown_handler)
 
 def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow, prev_mode, prev_demand):
-    global low_delta_persist, low_power_start_time, prev_hp_power, prev_flow_temp, prev_cop, cycle_type, demand_history, prod_history, grid_history, prev_time, cycle_start, prev_actual_loss, pause_count, undetected_count, first_loop, pause_end, prev_all_rates
+    global low_delta_persist, low_power_start_time, prev_hp_power, prev_flow_temp, prev_cop, cycle_type, demand_history, prod_history, grid_history, prev_time, cycle_start, prev_actual_loss, pause_count, undetected_count, first_loop, pause_end, prev_all_rates, epsilon, blend_factor
     try:
         current_time = time.time()
         time_delta = current_time - prev_time
@@ -451,15 +480,61 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
 
         flow_min = float(fetch_ha_entity(config['entities']['flow_min_temp']) or 32.0)
         flow_max = float(fetch_ha_entity(config['entities']['flow_max_temp']) or 50.0)
-        optimal_flow = max(flow_min, min(flow_max, 35 + (smoothed_demand / config['peak_loss'] * (flow_max - 35))))
+
+        # Compute deterministic flow and mode
+        det_flow = max(flow_min, min(flow_max, 35 + (smoothed_demand / config['peak_loss'] * (flow_max - 35))))
         wc_cap = min(50, max(30, 50 - (ext_temp * 1.2)))
+        det_flow = min(det_flow, wc_cap)
+        if upcoming_cold and current_rate < 0.15:
+            det_flow += 5
+            logging.info("Proactive heating would boost det_flow by 5°C due to forecast cold snap.")
+        if upcoming_high_wind and current_rate < 0.15:
+            det_flow += 3
+            logging.info("Proactive heating would boost det_flow by 3°C due to forecast high wind.")
+        det_flow = max(flow_min, min(flow_max, det_flow))
+
+        det_mode = 'heat' if smoothed_demand > 1.5 or ext_temp < 5 or (upcoming_cold and current_rate < 0.15) or (upcoming_high_wind and current_rate < 0.15) else 'off'
+        if excess_solar > 1 and det_mode == 'off':
+            logging.info("Would have used 'auto' in old logic—defaulting to 'off' for QSH control.")
+
+        # RL influence
+        states = torch.tensor([current_rate, soc, prev_cop, prev_flow, smoothed_demand, excess_solar, wind_speed, forecast_min_temp, smoothed_grid, delta_t, hp_power, chill_factor, demand_std], dtype=torch.float32)
+        action, value = model(states.unsqueeze(0))
+        action = action.squeeze(0)
+
+        mode_prob = F.sigmoid(action[0])
+        if random.random() < epsilon:
+            optimal_mode = 'heat' if random.random() > 0.5 else 'off'  # Explore
+        else:
+            optimal_mode = 'heat' if mode_prob > 0.5 else 'off'  # Greedy
+
+        actor_flow = 30 + (F.sigmoid(action[1]) * 20)
+        optimal_flow = (blend_factor * actor_flow.item()) + ((1 - blend_factor) * det_flow)
+
+        # Apply proactive if mode heat
+        if optimal_mode == 'heat':
+            if upcoming_cold and current_rate < 0.15:
+                optimal_flow += 5
+            if upcoming_high_wind and current_rate < 0.15:
+                optimal_flow += 3
+
+        # Safeguards
         optimal_flow = min(optimal_flow, wc_cap)
-        logging.info(f"DFAN WC applied: Capped flow to {optimal_flow:.1f}°C for ext_temp {ext_temp:.1f}°C")
-        
         if low_delta_persist >= 2:
             optimal_flow += 2.0
-            optimal_flow = min(optimal_flow, flow_max)
-            logging.info(f"DFAN ΔT safeguard: Boosted flow by 2°C (persistent ΔT: {delta_t:.1f}°C)")
+        optimal_flow = max(flow_min, min(flow_max, optimal_flow))
+
+        # Export safety override
+        if soc > 80 and export_kw > 1 and current_rate > 0.3:
+            optimal_mode = 'off'
+            logging.info("Export optimized pause: high SOC and export during peak rate—overriding to 'off'")
+
+        # Log overrides
+        if optimal_mode != det_mode:
+            logging.info(f"RL override: Changed mode from det '{det_mode}' to '{optimal_mode}' (prob: {mode_prob.item():.2f})")
+        flow_diff = abs(optimal_flow - det_flow)
+        if flow_diff > 2.0:
+            logging.info(f"RL adjusted flow by {flow_diff:.1f}°C from det {det_flow:.1f}°C to {optimal_flow:.1f}°C")
 
         optimal_flow = round(optimal_flow, 1)
         flow_min = round(flow_min, 1)
@@ -468,24 +543,6 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         
         flow_delta = abs(optimal_flow - prev_flow)
         flow_ramp_rate = abs(flow_delta) / (time_delta / 60) if time_delta > 0 else 0
-        
-        optimal_mode = 'heat'
-        if smoothed_demand > 1.5 or ext_temp < 5 or (upcoming_cold and current_rate < 0.15) or (upcoming_high_wind and current_rate < 0.15):
-            optimal_mode = 'heat'
-            if upcoming_cold and current_rate < 0.15:
-                optimal_flow += 5
-                logging.info("Proactive heating enabled due to forecast cold snap.")
-            if upcoming_high_wind and current_rate < 0.15:
-                optimal_flow += 3
-                logging.info("Proactive heating enabled due to forecast high wind.")
-        else:
-            optimal_mode = 'off'
-            if excess_solar > 1:
-                logging.info("Would have used 'auto' in old logic—defaulting to 'off' for QSH control.")
-        
-        if soc > 80 and export_kw > 1 and current_rate > 0.3:
-            optimal_mode = 'off'
-            logging.info("Export optimized pause: high SOC and export during peak rate")
         
         current_flow_temp = float(fetch_ha_entity(config['entities']['hp_flow_temp']) or 35.0)
         cop_value = fetch_ha_entity(config['entities']['hp_cop'])
@@ -571,8 +628,8 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             undetected_count += 1
         
         if live_cop <= 0:
-            logging.warning("Live COP <=0 outside cycle; using fallback COP.")
-            live_cop = 3.0  # Fallback to average COP
+            logging.warning("Live COP <=0 outside cycle; using previous COP.")
+            live_cop = prev_cop
 
         # Always update prev after detection/check
         prev_hp_power = hp_power
@@ -584,10 +641,6 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         logging.info(f"Mode decision: optimal_mode='{optimal_mode}', total_demand={smoothed_demand:.2f} kW, "
                      f"ext_temp={ext_temp:.1f}°C, upcoming_cold={upcoming_cold}, upcoming_high_wind={upcoming_high_wind}, current_rate={current_rate:.3f} GBP/kWh, "
                      f"hot_water_active={hot_water_active}")
-
-        states = torch.tensor([current_rate, soc, live_cop, optimal_flow, smoothed_demand, excess_solar, wind_speed, forecast_min_temp, smoothed_grid, delta_t, hp_power, chill_factor, demand_std], dtype=torch.float32)
-
-        action = model.actor(states.unsqueeze(0))
 
         # Reward adjustments from previous loss
         reward_adjust = 0
@@ -650,8 +703,17 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         reward -= volatility_penalty
         logging.info(f"DFAN RL: demand_std={demand_std:.2f} kW, volatility_penalty={volatility_penalty:.2f}")
 
-        value = model.critic(states.unsqueeze(0))
-        loss = (reward - value).pow(2).mean()
+        # A2C loss
+        td_error = reward - value.item()
+        critic_loss = td_error ** 2
+
+        optimal_mode_num = 1.0 if optimal_mode == 'heat' else 0.0
+        mode_log_prob = F.binary_cross_entropy_with_logits(action[0], torch.tensor(optimal_mode_num))
+        norm_flow = (optimal_flow - 30) / 20
+        flow_mse = (action[1] - torch.tensor(norm_flow)).pow(2)
+        actor_loss = mode_log_prob + flow_mse
+
+        loss = critic_loss + (0.5 * actor_loss)
 
         # Loss scaling for anomalies
         if smoothed_demand > 50:
@@ -670,6 +732,13 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
 
         reward_history.append(reward)
         loss_history.append(loss.item())
+
+        # Decay epsilon
+        epsilon = max(0.05, epsilon * 0.995)
+
+        # Ramp blend_factor if recent rewards positive
+        if len(reward_history) >= 10 and np.mean(list(reward_history)[-10:]) > 0:
+            blend_factor = min(1.0, blend_factor + 0.01)
 
         flow_delta = abs(optimal_flow - prev_flow)
         demand_delta = abs(smoothed_demand - prev_demand)
@@ -733,7 +802,7 @@ model = ActorCritic(state_dim, action_dim)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 states = torch.zeros(state_dim)
 
-train_rl(graph, states, HOUSE_CONFIG, model, optimizer)
+train_rl(model, optimizer)
 
 def live_loop(graph, states, config, model, optimizer):
     global action_counter, prev_flow, prev_mode, prev_demand
