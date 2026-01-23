@@ -439,12 +439,12 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         excess_solar = max(0, solar_production - hp_output) / 1000.0  # Assume W to kW
 
         # Rates
-        suppress_warning = datetime.now(timezone.utc).hour < 16
-        next_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['next_day_rates'], 'rates') or [])
-        all_rates = current_day_rates + next_day_rates
-        if all_rates != prev_all_rates:
-            prev_all_rates = all_rates
-            logging.info("Rates updated.")
+        current_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['current_day_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
+        next_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['next_day_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
+        current_day_export = parse_rates_array(fetch_ha_entity(config['entities']['current_day_export_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
+        next_day_export = parse_rates_array(fetch_ha_entity(config['entities']['next_day_export_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
+        all_rates = current_day_rates + next_day_rates + current_day_export + next_day_export
+        current_rate = get_current_rate(current_day_rates)
 
         # Loss calculation
         sum_af = sum(config['rooms'][room] * config['facings'][room] for room in config['rooms'])
