@@ -352,12 +352,11 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         
         if hot_water_active:
             logging.info("Hot water active: Pausing all QSH processing (space heating optimizations, RL updates, cycle detection, and HA sets).")
-            optimal_mode = 'off'
             optimal_flow = prev_flow  # Retain previous to avoid jumps on resume
             total_demand_adjusted = 0.0
             
             # Minimal logging for mode decision (demand=0)
-            logging.info(f"Mode decision: optimal_mode='off', total_demand=0.00 kW, ext_temp={ext_temp:.1f}°C, upcoming_cold=False, upcoming_high_wind=False, current_rate={current_rate:.3f} GBP/kWh, hot_water_active=True")
+            logging.info(f"Mode decision: total_demand=0.00 kW, ext_temp={ext_temp:.1f}°C, upcoming_cold=False, upcoming_high_wind=False, current_rate={current_rate:.3f} GBP/kWh, hot_water_active=True")
             
             # Reset cycle/low-power states to avoid false positives on resume
             low_delta_persist = 0
