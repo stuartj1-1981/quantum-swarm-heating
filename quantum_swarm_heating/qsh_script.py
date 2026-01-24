@@ -300,7 +300,7 @@ def train_rl(model, optimizer, episodes=500):
 demand_history = deque(maxlen=5)  # Extended to 5
 prod_history = deque(maxlen=5)
 grid_history = deque(maxlen=5)
-cop_history = deque(maxlen=5)  # For median non-zero COP
+cop_history = deque([4.0] * 5, maxlen=5)  # For median non-zero COP, init with Cosy 6 mild baseline
 heat_up_history = deque(maxlen=5)  # (time, aggregate_heat_up) for rate
 low_delta_persist = 0
 low_power_start_time = None
@@ -325,6 +325,7 @@ first_loop = True  # New: Flag for startup
 epsilon = 0.2  # Initial exploration rate
 blend_factor = 0.0  # Start at 0 for stability testing; ramp later
 last_heat_time = time.time() - 600  # Init as expired
+consecutive_slow = 0  # For heat_up hysteresis
 
 def shutdown_handler(sig, frame):
     mean_reward = sum(reward_history) / len(reward_history) if reward_history else 0
@@ -346,7 +347,7 @@ signal.signal(signal.SIGINT, shutdown_handler)
 signal.signal(signal.SIGTERM, shutdown_handler)
 
 def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow, prev_mode, prev_demand):
-    global low_delta_persist, low_power_start_time, prev_hp_power, prev_flow_temp, prev_cop, cycle_type, demand_history, prod_history, grid_history, prev_time, cycle_start, prev_actual_loss, pause_count, undetected_count, first_loop, pause_end, prev_all_rates, epsilon, blend_factor, cop_history, heat_up_history, last_heat_time
+    global low_delta_persist, low_power_start_time, prev_hp_power, prev_flow_temp, prev_cop, cycle_type, demand_history, prod_history, grid_history, prev_time, cycle_start, prev_actual_loss, pause_count, undetected_count, first_loop, pause_end, prev_all_rates, epsilon, blend_factor, cop_history, heat_up_history, last_heat_time, consecutive_slow
     try:
         current_time = time.time()
         time_delta = current_time - prev_time
@@ -481,9 +482,14 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         for room in config['rooms']:
             heating_entity = f'{room}_heating'
             if heating_entity in config['entities']:
-                heating_percs[room] = float(fetch_ha_entity(config['entities'][heating_entity]) or 0)
+                try:
+                    perc = float(fetch_ha_entity(config['entities'][heating_entity]) or '0')
+                except Exception as e:
+                    logging.warning(f"Fallback open perc 80% for {heating_entity}: {e}")
+                    perc = 80
             else:
-                heating_percs[room] = 0  # Fallback if not found
+                perc = 80  # Fallback if not found
+            heating_percs[room] = perc
         avg_open_frac = np.mean(list(heating_percs.values())) / 100 if heating_percs else 1.0
 
         total_demand_adjusted *= max(0.5, avg_open_frac)
@@ -502,10 +508,14 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
 
         heat_up_history.append((current_time, aggregate_heat_up))
         if len(heat_up_history) > 1:
-            dt = current_time - heat_up_history[0][0]
-            heat_up_rate = (aggregate_heat_up - heat_up_history[0][1]) / (dt / 60) if dt > 0 else 0
+            rates = []
+            for i in range(1, len(heat_up_history)):
+                dt = (heat_up_history[i][0] - heat_up_history[i-1][0]) / 60
+                dh = heat_up_history[i][1] - heat_up_history[i-1][1]
+                rates.append(dh / dt if dt > 0 else 0)
+            mean_rate = np.mean(rates) if rates else 0
         else:
-            heat_up_rate = 0
+            mean_rate = 0
 
         delta_t = float(fetch_ha_entity(config['entities']['primary_diff']) or 3.0)
         hp_power = float(fetch_ha_entity(config['entities']['hp_energy_rate']) or 0.0)
@@ -521,9 +531,13 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
 
         # Det flow (Point 4: Start low, increase on need)
         det_flow = 30 + (smoothed_demand / config['peak_loss'] * 10)  # Low scale, no WC
-        if heat_up_rate < 0.1 and avg_open_frac > 0.5:  # Slow rise with open valves? Increment
+        if mean_rate < 0.1:
+            consecutive_slow += 1
+        else:
+            consecutive_slow = 0
+        if consecutive_slow >= 3 and avg_open_frac > 0.5:  # Slow rise with open valves? Increment with hysteresis
             det_flow += 2
-            logging.info(f"Slow heat_up rate ({heat_up_rate:.2f}°C/min)—incrementing flow +2°C.")
+            logging.info(f"Slow heat_up rate ({mean_rate:.2f}°C/min)—incrementing flow +2°C.")
         if upcoming_cold and current_rate < 0.15:
             det_flow += 3  # Reduced proactive
         if upcoming_high_wind and current_rate < 0.15:
