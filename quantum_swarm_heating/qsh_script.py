@@ -293,9 +293,9 @@ class ActorCritic(nn.Module):
 def train_rl(model, optimizer, episodes=500):
     for _ in range(episodes):
         # Simulate hypothetical state (random for variety)
-        sim_state = torch.rand(13) * 10
-        action, value = model(sim_state.unsqueeze(0))  # <--- Critical: This line defines 'action' and 'value'
-        action = action.squeeze(0)  # <--- Squeeze the batch dim (from (1, action_dim) to (action_dim,))
+        sim_state = torch.rand(15) * 10  # Updated dim
+        action, value = model(sim_state.unsqueeze(0))
+        action = action.squeeze(0)
         
         # Simulate det logic approx (e.g., high demand → heat, high flow)
         sim_demand = sim_state[4].item()  # Index 4: smoothed_demand
@@ -392,6 +392,12 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         # Minimal fetching for log
         ext_temp = float(fetch_ha_entity(config['entities']['outdoor_temp']) or 0.0)
         current_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['current_day_rates'], 'rates') or [], suppress_warning=(datetime.now(timezone.utc).hour < 16))
+        # Rates retry (up to 3x on empty)
+        rates_retry = 0
+        while not current_day_rates and rates_retry < 3:
+            rates_retry += 1
+            logging.warning(f"Rates retry {rates_retry}/3...")
+            current_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['current_day_rates'], 'rates') or [])
         current_rate = get_current_rate(current_day_rates)
         
         if hot_water_active:
@@ -437,7 +443,8 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             # Skip to shadow sets and return
             clamped_demand = max(min(total_demand_adjusted, 15.0), 0.0)
             set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_total_demand', 'value': clamped_demand})
-            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_shadow_flow', 'value': optimal_flow})
+            clamped_flow = max(25.0, min(55.0, optimal_flow))  # New clamp
+            set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_shadow_flow', 'value': clamped_flow})
             set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_shadow_mode', 'option': optimal_mode})
             set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_optimal_mode', 'option': optimal_mode})
             clamped_reward = max(min(reward, 100.0), -100.0)
@@ -485,6 +492,12 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         # Rates
         suppress_warning = datetime.now(timezone.utc).hour < 16
         next_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['next_day_rates'], 'rates') or [])
+        # Retry for next_day too
+        rates_retry = 0
+        while not next_day_rates and rates_retry < 3:
+            rates_retry += 1
+            logging.warning(f"Next rates retry {rates_retry}/3...")
+            next_day_rates = parse_rates_array(fetch_ha_entity(config['entities']['next_day_rates'], 'rates') or [])
         all_rates = current_day_rates + next_day_rates
         if all_rates != prev_all_rates:
             prev_all_rates = all_rates
@@ -521,7 +534,7 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         total_demand_adjusted *= max(0.5, avg_open_frac)
         if avg_open_frac < 0.7:
             logging.warning(f"Low valve open frac ({avg_open_frac:.2f})—scaling demand and reducing flow.")
-        
+
         # Append to history and smooth
         demand_history.append(total_demand_adjusted)
         smoothed_demand = np.mean(demand_history)
@@ -545,13 +558,39 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
 
         delta_t = float(fetch_ha_entity(config['entities']['primary_diff']) or 3.0)
         hp_power = float(fetch_ha_entity(config['entities']['hp_energy_rate']) or 0.0)
+        logging.info(f"Current delta_t: {delta_t:.1f}°C, persist: {low_delta_persist}, avg_frac: {avg_open_frac:.2f}")
+
         if delta_t < 1.0:
             low_delta_persist += 1
-            if low_delta_persist >= 2:
-                logging.info(f"DFAN ΔT safeguard: Persistent ΔT {delta_t:.1f}°C <1.0°C—preparing flow boost.")
+        elif avg_open_frac < 0.6:
+            low_delta_persist = max(1, low_delta_persist)
         else:
             low_delta_persist = 0
 
+        if low_delta_persist >= 1:
+            low_frac_count = sum(1 for f in heating_percs.values() if f / 100 < 0.6)
+            logging.info(f"Low deltaT dissipation: {low_frac_count} low-frac zones—opening zones.")
+            for room in config['rooms']:
+                mode = config['room_control_mode'].get(room, 'indirect')
+                valve_entity = f'number.qsh_{room}_valve_target' if mode == 'direct' else None
+                effective_mode = 'indirect' if (mode == 'direct' and fetch_ha_entity(valve_entity) is None) else mode
+                
+                if effective_mode == 'direct':
+                    target_frac = random.uniform(80, 90) / 100
+                    if dfan_control:
+                        set_ha_service('number', 'set_value', {'entity_id': valve_entity, 'value': target_frac * 100})
+                    logging.info(f"Direct dissipate: {room} to {target_frac*100:.0f}%")
+                else:
+                    nudge = random.uniform(0.5, 1.0)
+                    new_accum = room_nudge_accum[room] + nudge
+                    if abs(new_accum) <= 3.0:  # Raised clamp
+                        room_nudge_accum[room] = new_accum
+                        room_targets[room] += nudge
+                        room_nudge_cooldown[room] = 0  # Bypass
+                        logging.info(f"Indirect dissipate: {room} +{nudge:.1f}°C (accum {new_accum:.1f}°C)")
+            
+            low_delta_persist = 0  # Reset
+        
         flow_min = float(fetch_ha_entity(config['entities']['flow_min_temp']) or 32.0)
         flow_max = float(fetch_ha_entity(config['entities']['flow_max_temp']) or 50.0)
 
@@ -574,7 +613,7 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         det_mode = 'heat' if smoothed_demand > 0 or aggregate_heat_up > 0.2 else 'off'
 
         # RL influence (limit to flow only; no mode)
-        states = torch.tensor([current_rate, soc, prev_cop, prev_flow, smoothed_demand, excess_solar, wind_speed, forecast_min_temp, smoothed_grid, delta_t, hp_power, chill_factor, demand_std], dtype=torch.float32)
+        states = torch.tensor([current_rate, soc, prev_cop, prev_flow, smoothed_demand, excess_solar, wind_speed, forecast_min_temp, smoothed_grid, delta_t, hp_power, chill_factor, demand_std, delta_t, avg_open_frac], dtype=torch.float32)  # Added delta_t/avg_frac
         action, value = model(states.unsqueeze(0))
         action = action.squeeze(0)
 
@@ -639,9 +678,9 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
                 
                 if nudge != 0.0:
                     new_accum = room_nudge_accum[room] + nudge
-                    if abs(new_accum) > 2.0:  # Clamp
+                    if abs(new_accum) > 3.0:  # Raised clamp
                         nudge = 0.0
-                        logging.warning(f"{room} nudge clamped at ±2°C.")
+                        logging.warning(f"{room} nudge clamped at ±3°C.")
                     else:
                         room_nudge_accum[room] = new_accum
                         room_targets[room] += nudge
@@ -808,6 +847,12 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         reward += (live_cop - 3.0) * 0.5 - (abs(aggregate_heat_up) * 0.1)  # Use aggregate
         reward += reward_adjust
 
+        # New reward tweaks for deltaT
+        if delta_t > 3.0:
+            reward += 0.5  # Bonus for healthy deltaT
+        if live_cop <= 0.5:
+            reward -= 1.0  # Penalty on low COP (shutdown proxy)
+
         volatile = abs(demand_delta) > 1.0
 
         # Penalties and bonuses
@@ -924,7 +969,8 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
 
         clamped_demand = max(min(total_demand_adjusted, 15.0), 0.0)
         set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_total_demand', 'value': clamped_demand})
-        set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_shadow_flow', 'value': optimal_flow})
+        clamped_flow = max(25.0, min(55.0, optimal_flow))  # New clamp
+        set_ha_service('input_number', 'set_value', {'entity_id': 'input_number.qsh_shadow_flow', 'value': clamped_flow})
         set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_shadow_mode', 'option': optimal_mode})
         set_ha_service('input_select', 'select_option', {'entity_id': 'input_select.qsh_optimal_mode', 'option': optimal_mode})
         clamped_reward = max(min(reward, 100.0), -100.0)
@@ -948,7 +994,7 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         return action_counter + 1, prev_flow, prev_mode, prev_demand
 
 graph = build_dfan_graph(HOUSE_CONFIG)
-state_dim = 13  # Updated for chill_factor + demand_std
+state_dim = 15  # Updated for chill_factor + demand_std + delta_t + avg_frac
 action_dim = 2
 model = ActorCritic(state_dim, action_dim)
 optimizer = optim.Adam(model.parameters(), lr=0.001)
