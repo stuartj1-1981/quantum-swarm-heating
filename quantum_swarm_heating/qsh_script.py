@@ -151,7 +151,7 @@ DEFAULT_INVERTER = {'fallback_efficiency': 0.95}
 DEFAULT_PEAK_LOSS = 5.0
 DEFAULT_DESIGN_TARGET = 21.0
 DEFAULT_PEAK_EXT = -3.0
-DEFAULT_THERMAL_MASS_PER_M2 = 0.03
+DEFAULT_THERMAL_MASS_PER_M2 = 0.02  # Lowered to reduce heat-up
 DEFAULT_HEAT_UP_TAU_H = 1.0
 DEFAULT_PERSISTENT_ZONES = ['bathroom', 'ensuite1', 'ensuite2']
 DEFAULT_HP_FLOW_SERVICE = {
@@ -472,11 +472,14 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         current_day_rates = fetch_ha_entity(config['entities']['current_day_rates'], attr='rates') or []
         next_day_rates = fetch_ha_entity(config['entities']['next_day_rates'], attr='rates') or []
         all_rates = parse_rates_array(current_day_rates) + parse_rates_array(next_day_rates)
-        current_rate = get_current_rate(all_rates) 
+        current_rate = get_current_rate(all_rates) / 100  # Assume pence to GBP
 
         room_targets = {}
         room_temps = {}
         open_fracs = []
+        room_maintenance = {}
+        room_deficit = {}
+        room_heat_up = {}
         for room in config['rooms']:
             offset = ZONE_OFFSETS.get(room, 0)
             if room in config['persistent_zones']:
@@ -497,18 +500,18 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             else:
                 open_frac = 1.0 if room_targets[room] > room_temps[room] else 0.0
             open_fracs.append(open_frac)
+            room_maintenance[room] = calc_room_loss(config, room, max(0, room_temps[room] - ext_temp - 2), chill_factor, loss_coeff, sum_af)  # Ignore small deltas
+            room_deficit[room] = calc_room_loss(config, room, room_targets[room] - room_temps[room], chill_factor, loss_coeff, sum_af)
+            room_heat_up[room] = max(0, (room_targets[room] - room_temps[room]) / config['heat_up_tau_h']) * config['rooms'][room] * config['thermal_mass_per_m2']
         avg_open_frac = np.mean(open_fracs) if open_fracs else 0.5
 
         sum_af = sum(config['rooms'][r] * config['facings'][r] for r in config['rooms'])
         loss_coeff = config['peak_loss'] / (config['design_target'] - config['peak_ext'])
 
         # Hybrid demand calc (reverted to v1.2.6 style with explicit hybrid)
-        maintenance_loss = sum(calc_room_loss(config, room, room_temps[room] - ext_temp, chill_factor, loss_coeff, sum_af) for room in config['rooms'])
-        deficit_loss = sum(calc_room_loss(config, room, room_targets[room] - room_temps[room], chill_factor, loss_coeff, sum_af) for room in config['rooms'])
-        aggregate_heat_up = 0.0
-        for room in config['rooms']:
-            heat_up = max(0, (room_targets[room] - room_temps[room]) / config['heat_up_tau_h']) * config['rooms'][room] * config['thermal_mass_per_m2']
-            aggregate_heat_up += heat_up
+        maintenance_loss = sum(room_maintenance.values())
+        deficit_loss = sum(room_deficit.values())
+        aggregate_heat_up = sum(room_heat_up.values())
 
         # Dissipation nudges
         dissipation_fired = False
@@ -541,6 +544,12 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
 
         total_demand = maintenance_loss + deficit_loss + aggregate_heat_up + total_nudges
         logging.info(f"Hybrid Demand Breakdown: Maintenance={maintenance_loss:.2f} kW, Deficit Loss={deficit_loss:.2f} kW, Heat-Up={aggregate_heat_up:.2f} kW, Nudges={total_nudges:.2f} kW, Total={total_demand:.2f} kW")
+        # Log top contributors if high
+        if total_demand > 12.0:
+            top_main = sorted(room_maintenance, key=room_maintenance.get, reverse=True)[:3]
+            top_def = sorted(room_deficit, key=room_deficit.get, reverse=True)[:3]
+            top_heat = sorted(room_heat_up, key=room_heat_up.get, reverse=True)[:3]
+            logging.info(f"High Demand Alert: Top Maintenance Rooms: {top_main}, Top Deficit: {top_def}, Top Heat-Up: {top_heat}")
 
         demand_history.append(total_demand)
         smoothed_demand = np.mean(demand_history)
@@ -699,8 +708,8 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             penalty = 2.5 if any(config['room_control_mode'].get(r, 'indirect') == 'direct' for r in config['rooms']) else 2.0
             reward -= penalty
 
-        if total_demand_adjusted > 12.0:
-            reward -= 0.5  # New penalty for high demand
+        if total_demand_adjusted > 10.0:
+            reward -= 0.5  # Penalty for high demand
 
         original_cop = float(fetch_ha_entity(config['entities'].get('hp_cop')) or 0)
         if original_cop <= 0:
