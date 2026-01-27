@@ -480,6 +480,8 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
         room_maintenance = {}
         room_deficit = {}
         room_heat_up = {}
+        sum_af = sum(config['rooms'][r] * config['facings'][r] for r in config['rooms'])
+        loss_coeff = config['peak_loss'] / (config['design_target'] - config['peak_ext'])
         for room in config['rooms']:
             offset = ZONE_OFFSETS.get(room, 0)
             if room in config['persistent_zones']:
@@ -504,9 +506,6 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             room_deficit[room] = calc_room_loss(config, room, room_targets[room] - room_temps[room], chill_factor, loss_coeff, sum_af)
             room_heat_up[room] = max(0, (room_targets[room] - room_temps[room]) / config['heat_up_tau_h']) * config['rooms'][room] * config['thermal_mass_per_m2']
         avg_open_frac = np.mean(open_fracs) if open_fracs else 0.5
-
-        sum_af = sum(config['rooms'][r] * config['facings'][r] for r in config['rooms'])
-        loss_coeff = config['peak_loss'] / (config['design_target'] - config['peak_ext'])
 
         # Hybrid demand calc (reverted to v1.2.6 style with explicit hybrid)
         maintenance_loss = sum(room_maintenance.values())
