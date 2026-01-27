@@ -30,14 +30,14 @@ logging.info(f"Loaded user_options: {user_options}")
 
 if not os.path.exists('/data/options.json'):
     try:
-    with open('/data/options.json', 'w') as f:
-        json.dump({
-        "house_battery": {
-            "min_soc_reserve": 4.0,
-            "efficiency": 0.9,
-            "voltage": 51.0,
-            "max_rate": 3.0
-        },
+        with open('/data/options.json', 'w') as f:
+            json.dump({
+                "house_battery": {
+                "min_soc_reserve": 4.0,
+                "efficiency": 0.9,
+                "voltage": 51.0,
+                "max_rate": 3.0
+            },
         }, f, indent=2)
     logging.info("Auto-created default options.json")
 
