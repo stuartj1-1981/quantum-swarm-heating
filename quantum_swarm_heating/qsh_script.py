@@ -211,55 +211,6 @@ if 'emitter_kw' in user_options:
     HOUSE_CONFIG['emitter_kw'] = user_options['emitter_kw']
     logging.info(f"Overrode emitter_kw from options.json: {HOUSE_CONFIG['emitter_kw']}")
 
-# Deep merge helper (handles nests/lists)
-def deep_merge(target, source):
-    for key, value in source.items():
-        if isinstance(value, dict) and key in target and isinstance(target[key], dict):
-            deep_merge(target[key], value)
-        elif isinstance(value, list) and key in target and isinstance(target[key], list):
-            target[key].extend(value)  # Append for lists like persistent_zones
-        else:
-            target[key] = value
-
-# Helper to safe-load JSON str or fallback
-def safe_json_load(s, fallback):
-    if not s:
-        return fallback
-    try:
-        return json.loads(s)
-    except json.JSONDecodeError as e:
-        logging.warning(f"JSON parse error for {s}: {e} - using fallback.")
-        return fallback
-
-# Flatten overrides (merge if parsed)
-flat_overrides = {
-    'rooms': safe_json_load(user_options.get('house_rooms'), {}),
-    'facings': safe_json_load(user_options.get('house_facings'), {}),
-    'entities': safe_json_load(user_options.get('house_entities'), {}),
-    'zone_sensor_map': safe_json_load(user_options.get('house_zone_sensor_map'), {}),
-    'battery': safe_json_load(user_options.get('house_battery'), {}),
-    'grid': safe_json_load(user_options.get('house_grid'), {}),
-    'fallback_rates': safe_json_load(user_options.get('house_fallback_rates'), {}),
-    'inverter': safe_json_load(user_options.get('house_inverter'), {}),
-    'persistent_zones': safe_json_load(user_options.get('house_persistent_zones'), []),
-    'hp_flow_service': safe_json_load(user_options.get('house_hp_flow_service'), {}),
-    'hp_hvac_service': safe_json_load(user_options.get('house_hp_hvac_service'), {}),
-    'room_control_mode': safe_json_load(user_options.get('house_room_control_mode'), {}),
-    'emitter_kw': safe_json_load(user_options.get('house_emitter_kw'), {}),
-}
-
-# Merge primitives directly (no JSON)
-for key in ['peak_loss', 'design_target', 'peak_ext', 'thermal_mass_per_m2', 'heat_up_tau_h']:
-    opt_key = f'house_{key}'
-    if opt_key in user_options:
-        HOUSE_CONFIG[key] = user_options[opt_key]
-
-# Deep merge flats
-for key, value in flat_overrides.items():
-    if value:  # Skip empty
-        deep_merge(HOUSE_CONFIG, {key: value})
-        logging.info(f"Applied override for {key}: {value}")
-
 # Zone offsets inferred from logs for balanced heating
 ZONE_OFFSETS = {
     'lounge': 0.1,
@@ -542,97 +493,107 @@ def sim_step(graph, states, config, model, optimizer, action_counter, prev_flow,
             'independent_sensor03': float(fetch_ha_entity(config['entities']['independent_sensor03']) or target_temp),
             'independent_sensor04': float(fetch_ha_entity(config['entities']['independent_sensor04']) or target_temp),
         }
-        
-        # Compute aggregate area*facing (sum_af) for loss normalization
-        sum_af = sum(area * facing for area, facing in zip(config['rooms'].values(), config['facings'].values()))
-        
-        # Compute loss_coeff from peak (dynamic if ext < peak_ext)
-        loss_coeff = config['peak_loss'] / (config['design_target'] - config['peak_ext'])
-        
-        # Fetch forecast (min_temp, wind for upcoming)
-        forecast_attrs = fetch_ha_entity(config['entities']['forecast_weather'], attr=True)
-        forecast = forecast_attrs.get('forecast', []) if forecast_attrs else []
-        forecast_min_temp = min(f.get('temperature', ext_temp) for f in forecast) if forecast else ext_temp
-        wind_speed = forecast_attrs.get('wind_speed', 0.0) if forecast_attrs else 0.0
+        current_temps = {room: sensor_temps[config['zone_sensor_map'][room]] for room in config['rooms']}
+
+        # Fetch forecast
+        forecast = fetch_ha_entity(config['entities']['forecast_weather'], 'forecast') or []
+        forecast_temps = [f['temperature'] for f in forecast if 'temperature' in f]
+        forecast_wind_speeds = [f['wind_speed'] for f in forecast if 'wind_speed' in f]
+        forecast_min_temp = min(forecast_temps or [ext_temp])
+        wind_speed = max(forecast_wind_speeds or [0.0])
         upcoming_cold = forecast_min_temp < 0
-        upcoming_high_wind = wind_speed > 20  # mph threshold for chill
-        
-        # Chill factor from wind
-        chill_factor = 1 + (wind_speed / 10.0) * 0.05  # Mild scaling
-        
-        # Solar/grid/battery
-        solar_prod = float(fetch_ha_entity(config['entities']['solar_production']) or 0.0)
-        prod_history.append(solar_prod)
+        upcoming_high_wind = wind_speed > 15
+
+        # Solar production
+        production = float(fetch_ha_entity(config['entities']['solar_production']) or 0.0)
+        prod_history.append(production)
         smoothed_prod = np.mean(prod_history)
-        solar_gain = calc_solar_gain(config, smoothed_prod)
-        
-        grid_power = float(fetch_ha_entity(config['entities']['grid_power']) or 0.0)
-        grid_history.append(grid_power)
-        smoothed_grid = np.mean(grid_history)
-        export_kw = max(0, -smoothed_grid / 1000.0)  # kW export (negative grid=export)
-        
+
+        # Battery SOC
         soc = float(fetch_ha_entity(config['entities']['battery_soc']) or 50.0)
-        excess_solar = max(0, smoothed_prod - (abs(smoothed_grid) if smoothed_grid < 0 else 0))
-        
-        # HP metrics
-        hp_power = float(fetch_ha_entity(config['entities']['hp_energy_rate']) or 0.0)
+
+        # Grid power (negative for import)
+        grid = float(fetch_ha_entity(config['entities']['grid_power']) or 0.0)
+        grid_history.append(grid)
+        smoothed_grid = np.mean(grid_history)
+        export_kw = max(0, -smoothed_grid / 1000.0)
+
+        # HP output, power, COP
         hp_output = float(fetch_ha_entity(config['entities']['hp_output']) or 0.0)
-        delta_t = float(fetch_ha_entity(config['entities']['primary_diff']) or 3.0)  # Primary ΔT
-        
-        # Valve % open (heating_percs)
-        heating_percs = {}
-        avg_open_frac = 0.0
-        for room in config['rooms']:
-            heating_entity = config['entities'].get(f'{room}_heating')
-            frac = float(fetch_ha_entity(heating_entity) or 0.0) / 100.0  # Assume 0-100%
-            heating_percs[room] = frac * 100  # Log as %
-            avg_open_frac += frac
-        avg_open_frac /= len(config['rooms']) if config['rooms'] else 1
-        
-        # Room heat_up rates (from zone sensors)
-        aggregate_heat_up = 0.0
-        for room, sensor_key in config['zone_sensor_map'].items():
-            sensor_temp = sensor_temps.get(sensor_key, target_temp)
-            delta_temp = room_targets[room] - sensor_temp
-            heat_up = delta_temp / config['heat_up_tau_h'] if config['heat_up_tau_h'] > 0 else 0.0
-            aggregate_heat_up += heat_up
-        
-        # Heat_up rate (mean from history)
-        heat_up_history.append((current_time, aggregate_heat_up))
-        if len(heat_up_history) > 1:
-            times, heat_ups = zip(*heat_up_history)
-            mean_rate = np.mean(np.diff(heat_ups) / np.diff(times) * 60)  # °C/min
-        else:
-            mean_rate = 0.0
-        
-        # Demand calc (adjusted loss - gains)
+        hp_power = float(fetch_ha_entity(config['entities']['hp_energy_rate']) or 0.0)
+
+        # Delta T
+        primary_diff = float(fetch_ha_entity(config['entities']['primary_diff']) or 3.0)
+        delta_t = abs(primary_diff)
+
+        # Chill factor
+        chill_factor = 1.0 + (wind_speed / 10.0) * 0.1 if wind_speed > 10 else 1.0
+
+        # Sum area*facing for loss coeff
+        sum_af = sum(config['rooms'][room] * config['facings'][room] for room in config['rooms'])
+
+        # Actual loss
+        loss_coeff = config['peak_loss'] / (config['design_target'] - config['peak_ext'])
         actual_loss = total_loss(config, ext_temp, room_targets, chill_factor, loss_coeff, sum_af)
-        total_demand = max(0, actual_loss - solar_gain)
-        total_demand_adjusted = total_demand + aggregate_heat_up
+
+        # Heat up power (additional demand for temp rise)
+        heat_up_power = sum(config['rooms'][room] * config['thermal_mass_per_m2'] * max(0, room_targets[room] - current_temps[room]) for room in config['rooms']) / config['heat_up_tau_h']
+        logging.info(f"Calculated heat_up_power: {heat_up_power:.2f} kW")
+
+        # Demand
+        total_demand = actual_loss + heat_up_power - calc_solar_gain(config, smoothed_prod)
+        total_demand_adjusted = max(0, total_demand) * (1 + (soc < 20) * 0.1 - (soc > 80) * 0.05)
         demand_history.append(total_demand_adjusted)
         smoothed_demand = np.mean(demand_history)
         demand_std = np.std(demand_history)
-        
-        # Dissipation priority (kW-based, hybrid direct/indirect)
+
+        # Excess solar
+        excess_solar = max(0, smoothed_prod - smoothed_demand)
+
+        # Fetch heating % for all rooms (Tado sensors, 0-100)
+        heating_percs = {}
+        for room in config['rooms']:
+            entity_key = room + '_heating'
+            if entity_key in config['entities']:
+                perc = float(fetch_ha_entity(config['entities'][entity_key]) or 0.0)
+                heating_percs[room] = perc
+            else:
+                heating_percs[room] = 0.0  # Fallback
+        avg_open_frac = np.mean(list(heating_percs.values())) / 100.0
+
+        # Aggregate heat_up
+        aggregate_heat_up = sum(max(0, room_targets[room] - current_temps[room]) for room in config['rooms'])
+        heat_up_history.append((current_time, aggregate_heat_up))
+        if len(heat_up_history) >= 2:
+            dt = heat_up_history[-1][0] - heat_up_history[-2][0]
+            dhu = heat_up_history[-1][1] - heat_up_history[-2][1]
+            mean_rate = dhu / (dt / 60) if dt > 0 else 0.0
+        else:
+            mean_rate = 0.0
+
+        # Low deltaT persist (faster triggers)
+        if delta_t < 2.5:
+            low_delta_persist += 1
+        else:
+            low_delta_persist = max(0, low_delta_persist - 1)
+
+        # Emitter-smart dissipation w/ energy dispersion est
         dissipation_fired = False
-        total_disp = 0.0
-        if low_delta_persist >= 3:  # Trigger on persist low ΔT
+        if low_delta_persist >= 1 or avg_open_frac < 0.6:
             dissipation_fired = True
-            logging.warning(f"Dissipation trigger: low_delta_persist={low_delta_persist} (ΔT={delta_t:.1f}°C)")
-            heating_deltas = {}
-            for room, sensor_key in config['zone_sensor_map'].items():
-                sensor_temp = sensor_temps.get(sensor_key, target_temp)
-                delta_temp = sensor_temp - room_targets[room]  # Negative if under
-                heating_deltas[room] = (delta_temp, config['emitter_kw'][room])
-            # Sort by emitter kW * |delta| (prioritize large emitters under target)
-            top_opens = sorted(heating_deltas.items(), key=lambda x: abs(x[1][0]) * x[1][1], reverse=True)[:5]  # Top 5
+            low_frac_rooms = [r for r in config['rooms'] if heating_percs[r] / 100.0 < 0.6]
+            rooms_sorted = sorted(low_frac_rooms, key=lambda r: config['emitter_kw'][r] * max(0, room_targets[r] - current_temps[r]), reverse=True)
+            top_opens = rooms_sorted[:3 + random.randint(0, 2)]
+            total_disp = sum(config['emitter_kw'][r] * max(0, room_targets[r] - current_temps[r]) for r in low_frac_rooms)
+            low_frac_count = len(low_frac_rooms)
+            logging.info(f"Low deltaT dissipation: {low_frac_count} low-frac zones—opening top {len(top_opens)} by kW-disp: {top_opens}.")
             successful_opens = 0
-            for room, (delta_temp, kw_rating) in top_opens:
-                if delta_temp >= 0:  # Over target? Skip open
-                    continue
-                nudge = min(2.0, abs(delta_temp))  # Cap at 2°C
-                valve_entity = config['entities'].get(f'{room}_heating')  # Reuse heating for valve if direct
+            for room in top_opens:
+                delta_temp = max(0, room_targets[room] - current_temps[room])
+                share = (config['emitter_kw'][room] * delta_temp) / total_disp if total_disp > 0 else 0
+                nudge = share * 3.0  # Nudge budget=3°C, clamp ±3°C overall via accum
                 mode = config['room_control_mode'].get(room, 'indirect')
+                valve_entity = f'number.qsh_{room}_valve_target'
                 effective_mode = 'indirect' if (mode == 'direct' and fetch_ha_entity(valve_entity) is None) else mode
                 
                 if effective_mode == 'direct':
