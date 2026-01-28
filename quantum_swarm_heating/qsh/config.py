@@ -1,3 +1,7 @@
+import os
+import json
+import logging
+
 if not os.path.exists('/data/options.json'):
     try:
         default_config = {

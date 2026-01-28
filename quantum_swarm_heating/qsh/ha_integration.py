@@ -1,3 +1,7 @@
+import requests
+import logging
+import os
+
 HA_URL = 'http://supervisor/core'
 TOKEN = os.getenv('SUPERVISOR_TOKEN')
 REQUEST_TIMEOUT = 2  # seconds

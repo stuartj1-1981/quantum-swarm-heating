@@ -2,6 +2,13 @@ from .utils import safe_float, total_loss, calc_room_loss, shutdown_handler, get
 from .ha_integration import fetch_ha_entity, set_ha_service
 from .config import HOUSE_CONFIG, ZONE_OFFSETS
 from .rl_model import ActorCritic
+import time
+import logging
+import json
+import signal
+import sys
+from collections import deque
+import numpy as np
 
 
 MIN_MODULATION_POWER = 0.20
