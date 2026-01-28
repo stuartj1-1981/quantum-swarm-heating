@@ -18,6 +18,7 @@ from collections import defaultdict, deque
 import signal
 import sys
 import numpy as np
+from .graph import build_dfan_graph
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
