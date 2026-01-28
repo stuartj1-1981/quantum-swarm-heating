@@ -19,6 +19,7 @@ import signal
 import sys
 import numpy as np
 from .graph import build_dfan_graph
+from .ha_integration import set_ha_service    # for failsafe
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -34,6 +35,8 @@ logging.info(f"Loaded user_options: {user_options}")
 def main():
     global prev_flow, prev_mode, prev_demand, action_counter
 
+    action_counter = 0   # ← add this line
+
     graph = build_dfan_graph(HOUSE_CONFIG)
     state_dim = 15
     action_dim = 2
@@ -41,7 +44,7 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
 
     try:
-        train_rl(model, optimizer, episodes=200)
+        train_rl(model, optimizer, episodes=10)   # reduce further if startup still slow
     except Exception as e:
         logging.error(f"RL training failed, continuing with untrained model: {e}")
 
